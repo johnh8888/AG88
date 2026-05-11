@@ -13,29 +13,24 @@ import pandas as pd
 import requests
 
 warnings.filterwarnings("ignore")
-
-# 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ==================== 可调节配置 ====================
+# ==================== 配置 ====================
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
 TEST_MODE = os.getenv("TEST_MODE", "1") == "1"
 
 TOTAL_CAPITAL = 20000
-TRADE_RATIO = 0.6                      # 正常仓位
+TRADE_RATIO = 0.6
 FIX_AMOUNT = int(TOTAL_CAPITAL * TRADE_RATIO)
 
-# 交易时间规则（北京时间）
 MORNING_START, MORNING_END = 10, 10.67
 AFTERNOON_START, AFTERNOON_END = 14.67, 14.92
-TRADE_WEEKDAYS = {0, 1, 2, 3}         # 周一至周四
+TRADE_WEEKDAYS = {0, 1, 2, 3}
 
-# 风控
 LOW_BUY_RATIO = 0.997
 HARD_STOP_RATIO = -0.02
 MAX_ACCEPTABLE_MARKET_DROP = -0.35
 
-# 手续费
 BUY_FEE_RATE = 0.0003
 SELL_FEE_RATE = 0.0003
 SELL_TAX_RATE = 0.0005
@@ -44,18 +39,17 @@ NET_PROFIT_TARGET_MIN = 250
 NET_PROFIT_TARGET_MAX = 350
 
 # ---------- 过滤开关 ----------
-MA20_FILTER = False                   # 大盘20日线过滤
-SECTOR_FILTER_ENABLED = False         # 板块排名过滤
-CONSECUTIVE_UP_ENABLED = False        # 连续小阳过滤
+MA20_FILTER = False
+SECTOR_FILTER_ENABLED = False
+CONSECUTIVE_UP_ENABLED = False
 
-# ---------- 新增过滤开关 ----------
-INDIVIDUAL_MA_FILTER = True           # 个股站上20日均线
+# ---------- 新增强化过滤 ----------
+INDIVIDUAL_MA_FILTER = True
 MA_PERIOD = 20
-MAIN_INFLOW_FILTER = True            # 要求当日主力净流入>0
-RECENT_LIMIT_DOWN_FILTER = True      # 剔除近5日有过跌停的股票
+MAIN_INFLOW_FILTER = True
+RECENT_LIMIT_DOWN_FILTER = True
 LIMIT_DOWN_LOOKBACK = 5
 
-# 筛选数值参数
 MIN_PRICE, MAX_PRICE = 8, 30
 EARLY_MIN_PCT = 0.8
 MIN_AMOUNT = 1.5e8
@@ -65,29 +59,25 @@ MIN_AMPLITUDE, MAX_AMPLITUDE = 1.8, 7.0
 MAX_OPEN_PCT = 2.0
 MAX_PCT = 5.5
 
-# 尾盘条件
 EOD_MAX_PCT = 1.8
 EOD_MIN_PCT = -0.5
 EOD_MAX_TURNOVER = 4.5
 EOD_MIN_LB, EOD_MAX_LB = 0.9, 1.5
 EOD_MAX_AMPLITUDE = 3.5
 
-# 技术 & 评分
-MIN_SCORE_THRESHOLD = 7.0              # 归一化后阈值
+MIN_SCORE_THRESHOLD = 7.0
 TOP_N_CANDIDATES = 5
-FINAL_HOLDINGS = 3                     # 最终推荐持仓数（2~3只）
+FINAL_HOLDINGS = 3
 BACKTEST_LOOKBACK_DAYS = 180
 BACKTEST_MIN_SIGNALS = 3
 MIN_CONSECUTIVE_UP = 3
 FUNDAMENTAL_CHECK = True
 
-# 北京时间
 TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
 now = datetime.now(TZ_SHANGHAI)
 today = now.strftime("%Y%m%d")
 week_num = now.weekday()
 current_hour = now.hour + now.minute / 60.0
-
 
 # ---------- 工具函数 ----------
 def push(title, content):
@@ -95,8 +85,7 @@ def push(title, content):
         try:
             requests.post("http://www.pushplus.plus/send",
                           json={"token": PUSHPLUS_TOKEN, "title": title,
-                                "content": content, "template": "markdown"},
-                          timeout=10)
+                                "content": content, "template": "markdown"}, timeout=10)
         except Exception as e:
             logging.warning(f"推送失败: {e}")
 
@@ -165,50 +154,39 @@ def get_market_ma20_safe():
 
 # ---------- 新增过滤函数 ----------
 def is_above_ma(code, period=MA_PERIOD):
-    """个股是否在MA之上（使用前复权数据）"""
-    if not INDIVIDUAL_MA_FILTER:
-        return True
+    if not INDIVIDUAL_MA_FILTER: return True
     try:
         end = now.strftime("%Y%m%d")
         start = (now - timedelta(days=80)).strftime("%Y%m%d")
         hist = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
-        if hist is None or hist.empty or len(hist) < period:
-            return True
+        if hist is None or hist.empty or len(hist) < period: return True
         close = hist["收盘"].astype(float)
         ma = close.rolling(period).mean().iloc[-1]
         return close.iloc[-1] > ma
     except Exception as e:
         logging.debug(f"MA过滤失败 {code}: {e}")
-        return True  # 未知则通过
+        return True
 
 def has_main_inflow(code):
-    """当日主力净流入>0（按市场区分）"""
-    if not MAIN_INFLOW_FILTER:
-        return True
+    if not MAIN_INFLOW_FILTER: return True
     try:
         market = "sh" if code.startswith("6") else "sz"
         flow = ak.stock_individual_fund_flow(stock=code, market=market)
-        if flow is None or flow.empty:
-            return True
+        if flow is None or flow.empty: return True
         return float(flow["主力净流入"].iloc[-1]) > 0
     except Exception as e:
         logging.debug(f"资金流过滤失败 {code}: {e}")
         return True
 
 def has_recent_limit_down(code, days=LIMIT_DOWN_LOOKBACK):
-    """近N日是否有过跌停（收盘价接近跌停价）"""
-    if not RECENT_LIMIT_DOWN_FILTER:
-        return False
+    if not RECENT_LIMIT_DOWN_FILTER: return False
     try:
         end = now.strftime("%Y%m%d")
         start = (now - timedelta(days=60)).strftime("%Y%m%d")
         hist = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
-        if hist is None or hist.empty:
-            return False
+        if hist is None or hist.empty: return False
         close = hist["收盘"].astype(float)
         preclose = hist["昨收"].astype(float) if "昨收" in hist.columns else close.shift(1)
-        limit_down = (preclose * 0.9).round(2)
-        # 近N日任意一天收盘价接近跌停价（误差0.01）
         recent = hist.tail(days)
         for c, ld in zip(recent["收盘"].astype(float), recent["昨收"].astype(float) if "昨收" in recent else recent["收盘"].shift(1).fillna(0)):
             if abs(c - round(ld*0.9, 2)) < 0.01:
@@ -218,22 +196,18 @@ def has_recent_limit_down(code, days=LIMIT_DOWN_LOOKBACK):
         logging.debug(f"跌停检查失败 {code}: {e}")
         return False
 
-# ---------- 回测相关 ----------
+# ---------- 回测 ----------
 def is_suspended(row):
-    """通过成交额或换手率为0判断停牌"""
     amount = safe_float(row.get("amount", row.get("成交额")), 0)
     turnover = safe_float(row.get("turnover", row.get("换手率")), 0)
     return amount <= 0 and turnover <= 0
 
 def is_limit_up_down(next_open, next_high, next_low, prev_close):
-    if prev_close <= 0 or next_open <= 0:
-        return False
+    if prev_close <= 0 or next_open <= 0: return False
     up = round(prev_close * 1.10, 2)
     dn = round(prev_close * 0.90, 2)
-    if (abs(next_open - up) < 0.01 and abs(next_high - up) < 0.01 and abs(next_low - up) < 0.01):
-        return True
-    if (abs(next_open - dn) < 0.01 and abs(next_high - dn) < 0.01 and abs(next_low - dn) < 0.01):
-        return True
+    if (abs(next_open - up) < 0.01 and abs(next_high - up) < 0.01 and abs(next_low - up) < 0.01): return True
+    if (abs(next_open - dn) < 0.01 and abs(next_high - dn) < 0.01 and abs(next_low - dn) < 0.01): return True
     return False
 
 def evaluate_stock_history(symbol):
@@ -244,28 +218,18 @@ def evaluate_stock_history(symbol):
     except Exception as e:
         logging.warning(f"历史数据失败 {symbol}: {e}")
         return default_history_result()
+    if hist is None or hist.empty: return default_history_result()
 
-    if hist is None or hist.empty:
-        return default_history_result()
-
-    hist = hist.rename(columns={
-        "日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
-        "最低": "low", "涨跌幅": "pct", "成交额": "amount",
-        "换手率": "turnover", "振幅": "amplitude"
-    }).copy()
+    hist = hist.rename(columns={"日期": "date", "开盘": "open", "收盘": "close", "最高": "high",
+                                "最低": "low", "涨跌幅": "pct", "成交额": "amount",
+                                "换手率": "turnover", "振幅": "amplitude"}).copy()
     hist = hist.sort_values("date").tail(BACKTEST_LOOKBACK_DAYS).reset_index(drop=True)
     hist["open_pct"] = (hist["open"] / hist["close"].shift(1) - 1) * 100
 
     signals = []
-    for i in range(1, len(hist) - 1):
-        row = hist.iloc[i]
-        nxt = hist.iloc[i + 1]
-
-        # 停牌跳过
-        if is_suspended(row) or is_suspended(nxt):
-            continue
-
-        # 当日条件
+    for i in range(1, len(hist)-1):
+        row = hist.iloc[i]; nxt = hist.iloc[i+1]
+        if is_suspended(row) or is_suspended(nxt): continue
         if not (EARLY_MIN_PCT <= safe_float(row["pct"]) <= MAX_PCT and
                 safe_float(row["amount"]) >= MIN_AMOUNT and
                 MIN_TURNOVER <= safe_float(row.get("turnover"), 0) <= MAX_TURNOVER and
@@ -273,124 +237,94 @@ def evaluate_stock_history(symbol):
                 MIN_PRICE <= safe_float(row["close"]) <= MAX_PRICE and
                 safe_float(row.get("open_pct"), 999) <= MAX_OPEN_PCT):
             continue
-
         buy_price = safe_float(nxt["open"])
-        if buy_price <= 0:
-            continue
-
-        # 排除一字板
+        if buy_price <= 0: continue
         if is_limit_up_down(buy_price, safe_float(nxt["high"]), safe_float(nxt["low"]), safe_float(row["close"])):
             continue
-
-        next_high = safe_float(nxt["high"])
-        next_low = safe_float(nxt["low"])
-        next_close = safe_float(nxt["close"])
-
+        next_high = safe_float(nxt["high"]); next_low = safe_float(nxt["low"]); next_close = safe_float(nxt["close"])
         t250 = calc_target_sell_price(buy_price, FIX_AMOUNT, NET_PROFIT_TARGET_MIN)
         t350 = calc_target_sell_price(buy_price, FIX_AMOUNT, NET_PROFIT_TARGET_MAX)
-
         signals.append({
             "win": 1 if next_close > buy_price else 0,
             "target_250_hit": 1 if next_high >= t250 else 0,
             "target_350_hit": 1 if next_high >= t350 else 0,
-            "next_close_ret": (next_close / buy_price - 1) * 100,
-            "next_high_ret": (next_high / buy_price - 1) * 100,
-            "next_low_ret": (next_low / buy_price - 1) * 100,
+            "next_close_ret": (next_close/buy_price-1)*100,
+            "next_high_ret": (next_high/buy_price-1)*100,
+            "next_low_ret": (next_low/buy_price-1)*100,
         })
-
-    if not signals:
-        return default_history_result()
-
+    if not signals: return default_history_result()
     s = pd.DataFrame(signals)
     n_sig = len(s)
-    win_r = float(s["win"].mean() * 100)
-    hit250 = float(s["target_250_hit"].mean() * 100)
-    hit350 = float(s["target_350_hit"].mean() * 100)
+    win_r = float(s["win"].mean()*100)
+    hit250 = float(s["target_250_hit"].mean()*100)
+    hit350 = float(s["target_350_hit"].mean()*100)
     avg_c = float(s["next_close_ret"].mean())
     avg_h = float(s["next_high_ret"].mean())
     avg_l = float(s["next_low_ret"].mean())
-
     penalty = min(n_sig, 15) / 15
-    score = (win_r * 0.22 + hit250 * 0.38 + hit350 * 0.22 +
-             avg_c * 9.0 + avg_h * 4.5 + avg_l * 2.0) * penalty
-
+    score = (win_r*0.22 + hit250*0.38 + hit350*0.22 + avg_c*9.0 + avg_h*4.5 + avg_l*2.0) * penalty
     return {"signals": n_sig, "win_rate": win_r, "target_250_hit_rate": hit250,
-            "target_350_hit_rate": hit350, "avg_next_close": avg_c,
-            "avg_next_high": avg_h, "avg_worst_drawdown": avg_l, "history_score": score}
+            "target_350_hit_rate": hit350, "avg_next_close": avg_c, "avg_next_high": avg_h,
+            "avg_worst_drawdown": avg_l, "history_score": score}
 
 def default_history_result():
     return {"signals": 0, "win_rate": 0.0, "target_250_hit_rate": 0.0,
             "target_350_hit_rate": 0.0, "avg_next_close": 0.0,
             "avg_next_high": 0.0, "avg_worst_drawdown": 0.0, "history_score": -999}
 
-# ---------- 行情获取（双源容错） ----------
-def fetch_spot_data():
-    required_cols = ["代码", "名称", "最新价", "涨跌幅", "成交额", "换手率", "振幅", "今开", "昨收"]
-    for attempt in range(1, 3):
-        try:
-            logging.info(f"东方财富行情，第{attempt}次尝试...")
-            raw = ak.stock_zh_a_spot_em()
-            if raw is None or raw.empty:
-                continue
-            missing = [c for c in required_cols if c not in raw.columns]
-            if missing:
-                logging.error(f"东方财富缺失必要列: {missing}")
-                continue
-            standard = pd.DataFrame()
-            standard["code"] = raw["代码"]
-            standard["name"] = raw["名称"]
-            standard["price"] = raw["最新价"].astype(float)
-            standard["pct"] = raw["涨跌幅"].astype(float)
-            standard["amount"] = raw["成交额"].astype(float)
-            standard["lb"] = raw.get("量比", pd.Series([1.0]*len(raw))).astype(float)
-            standard["turnover"] = raw["换手率"].astype(float)
-            standard["amplitude"] = raw["振幅"].astype(float)
-            standard["open"] = raw["今开"].astype(float)
-            standard["prev_close"] = raw["昨收"].astype(float)
-            for col in ["行业", "所属行业"]:
-                if col in raw.columns: standard[col] = raw[col]
-            logging.info("东方财富行情成功")
-            return standard
-        except Exception as e:
-            logging.error(f"东方财富行情失败: {e}")
-            time.sleep(3)
-
-    try:
-        logging.info("尝试新浪行情...")
-        raw = ak.stock_zh_a_spot()
-        if raw is None or raw.empty: return pd.DataFrame()
-        standard = pd.DataFrame()
-        standard["code"] = raw["代码"]
-        standard["name"] = raw["名称"]
-        standard["price"] = pd.to_numeric(raw["最新价"], errors="coerce")
-        standard["pct"] = pd.to_numeric(raw["涨跌幅"], errors="coerce")
-        standard["amount"] = pd.to_numeric(raw["成交额"], errors="coerce")
-        standard["lb"] = 1.0
-        standard["turnover"] = pd.to_numeric(raw.get("换手率", pd.Series([0]*len(raw))), errors="coerce")
-        standard["amplitude"] = pd.to_numeric(raw.get("振幅", pd.Series([0]*len(raw))), errors="coerce")
-        standard["open"] = pd.to_numeric(raw.get("今开", raw["最新价"]), errors="coerce")
-        standard["prev_close"] = pd.to_numeric(raw.get("昨收", raw["最新价"]), errors="coerce")
-        logging.info("新浪行情成功")
-        return standard
-    except Exception as e:
-        logging.error(f"新浪行情失败: {e}")
-        return pd.DataFrame()
-
-# ---------- 分位数归一化 ----------
 def quantile_norm(series, n_quantiles=5):
-    """将序列映射到0~1，基于分位数（抗极端值）"""
-    if series.nunique() <= 1:
-        return pd.Series(0.5, index=series.index)
+    if series.nunique() <= 1: return pd.Series(0.5, index=series.index)
     try:
         qs = [series.quantile(i/n_quantiles) for i in range(n_quantiles+1)]
         def map_q(x):
             for i, q in enumerate(qs):
-                if x <= q:
-                    return i / n_quantiles
+                if x <= q: return i/n_quantiles
             return 1.0
         return series.apply(map_q)
-    except:
-        return (series - series.min()) / (series.max() - series.min() + 1e-9)
+    except: return (series-series.min())/(series.max()-series.min()+1e-9)
+
+# ---------- 行情 ----------
+def fetch_spot_data():
+    required_cols = ["代码","名称","最新价","涨跌幅","成交额","换手率","振幅","今开","昨收"]
+    for attempt in range(1,3):
+        try:
+            raw = ak.stock_zh_a_spot_em()
+            if raw is None or raw.empty: continue
+            missing = [c for c in required_cols if c not in raw.columns]
+            if missing:
+                logging.error(f"东方财富缺失列: {missing}")
+                continue
+            df = pd.DataFrame()
+            df["code"] = raw["代码"]; df["name"] = raw["名称"]
+            df["price"] = raw["最新价"].astype(float); df["pct"] = raw["涨跌幅"].astype(float)
+            df["amount"] = raw["成交额"].astype(float); df["lb"] = raw.get("量比", pd.Series([1.0]*len(raw))).astype(float)
+            df["turnover"] = raw["换手率"].astype(float); df["amplitude"] = raw["振幅"].astype(float)
+            df["open"] = raw["今开"].astype(float); df["prev_close"] = raw["昨收"].astype(float)
+            for col in ["行业","所属行业"]:
+                if col in raw.columns: df[col] = raw[col]
+            logging.info("东方财富行情成功")
+            return df
+        except Exception as e:
+            logging.error(f"东方财富行情失败: {e}")
+            time.sleep(3)
+    try:
+        raw = ak.stock_zh_a_spot()
+        if raw is None or raw.empty: return pd.DataFrame()
+        df = pd.DataFrame()
+        df["code"] = raw["代码"]; df["name"] = raw["名称"]
+        df["price"] = pd.to_numeric(raw["最新价"], errors="coerce")
+        df["pct"] = pd.to_numeric(raw["涨跌幅"], errors="coerce")
+        df["amount"] = pd.to_numeric(raw["成交额"], errors="coerce")
+        df["lb"] = 1.0
+        df["turnover"] = pd.to_numeric(raw.get("换手率", pd.Series([0]*len(raw))), errors="coerce")
+        df["amplitude"] = pd.to_numeric(raw.get("振幅", pd.Series([0]*len(raw))), errors="coerce")
+        df["open"] = pd.to_numeric(raw.get("今开", raw["最新价"]), errors="coerce")
+        df["prev_close"] = pd.to_numeric(raw.get("昨收", raw["最新价"]), errors="coerce")
+        logging.info("新浪行情成功")
+        return df
+    except Exception as e:
+        logging.error(f"新浪行情失败: {e}")
+        return pd.DataFrame()
 
 # ==================== 主流程 ====================
 if not TEST_MODE:
@@ -400,84 +334,68 @@ if not TEST_MODE:
         logging.info("非允许交易时段，退出")
         sys.exit(0)
 else:
-    in_morning = True
-    in_afternoon = False
+    in_morning = True; in_afternoon = False
 
-# 大盘仓位建议
-suggested_position_ratio = 0.6   # 默认 6 成
+suggested_position_ratio = 0.6
 if MA20_FILTER:
     _, _, ma_safe = get_market_ma20_safe()
     if not ma_safe and not TEST_MODE:
-        logging.info("大盘不在20日线上方，暂停开仓")
+        logging.info("大盘不在20日线上，暂停开仓")
         sys.exit(0)
-    if not ma_safe:
-        suggested_position_ratio = 0.3   # 大盘弱势降至3成
-    else:
-        suggested_position_ratio = 0.6
+    suggested_position_ratio = 0.3 if not ma_safe else 0.6
 else:
-    # 即便不开过滤，也给出建议仓位（基于大盘均线）
     try:
         close, ma20, _ = get_market_ma20_safe()
         if close > 0 and ma20 > 0:
             suggested_position_ratio = 0.6 if close > ma20 else 0.3
-    except:
-        pass
+    except: pass
 
-# 获取行情
 raw_df = fetch_spot_data()
 if raw_df.empty:
     logging.error("行情获取失败，退出")
     sys.exit(0)
 
 market_pct = 0.0
-name_col = "name"
-if name_col in raw_df.columns:
-    sh_mask = raw_df[name_col].str.contains("上证指数|上证综合指数", na=False)
-    if sh_mask.any():
-        market_pct = safe_float(raw_df.loc[sh_mask, "pct"].iloc[0], 0.0)
-
+if "name" in raw_df.columns:
+    sh_mask = raw_df["name"].str.contains("上证指数|上证综合指数", na=False)
+    if sh_mask.any(): market_pct = safe_float(raw_df.loc[sh_mask, "pct"].iloc[0], 0.0)
 if market_is_weak(market_pct):
     logging.info(f"市场跌幅 {market_pct:.2f}% 过深，空仓")
     sys.exit(0)
 
 df = raw_df.copy()
 df["open_pct"] = df.apply(calc_open_pct, axis=1)
-for col in ["turnover", "amplitude", "open_pct"]:
-    df[col] = get_col(df, col, np.nan)
+for col in ["turnover","amplitude","open_pct"]: df[col] = get_col(df, col, np.nan)
 
-# 基础版块剔除
 ban_pattern = r"(^ST|^\*ST|退市|^N|^C[^N]|XD|XR)"
 df = df[~df["name"].str.contains(ban_pattern, na=False, regex=True)]
-df = df[(df["code"].astype(str).str.startswith(("60", "00")))]
+df = df[(df["code"].astype(str).str.startswith(("60","00")))]
 
-# 板块过滤
+# 暂不使用的板块过滤
 if SECTOR_FILTER_ENABLED:
-    sector_map = get_sector_rank_map()
-    if sector_map:
-        sector_pcts = sorted(sector_map.values(), reverse=True)
-        cutoff_idx = int(len(sector_pcts) * 0.4)
-        cutoff_pct = sector_pcts[cutoff_idx] if sector_pcts else -100
-        sector_col = None
-        for col_name in ["行业", "所属行业"]:
-            if col_name in df.columns:
-                sector_col = col_name
-                break
-        if sector_col:
-            df["sector_pct"] = df[sector_col].map(sector_map)
-            df = df[df["sector_pct"].notna() & (df["sector_pct"] >= cutoff_pct)]
-    else:
-        logging.warning("板块排名为空，跳过过滤")
+    try:
+        sector_map = get_sector_rank_map()
+        if sector_map:
+            sector_pcts = sorted(sector_map.values(), reverse=True)
+            cutoff_idx = int(len(sector_pcts)*0.4)
+            cutoff_pct = sector_pcts[cutoff_idx] if sector_pcts else -100
+            if "行业" in df.columns or "所属行业" in df.columns:
+                col = "行业" if "行业" in df.columns else "所属行业"
+                df["sector_pct"] = df[col].map(sector_map)
+                df = df[df["sector_pct"].notna() & (df["sector_pct"] >= cutoff_pct)]
+    except Exception as e:
+        logging.warning(f"板块过滤失败: {e}")
 
 # 早盘筛选
 if in_morning:
     filtered = df[
-        (df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE) &
-        (df["pct"] >= EARLY_MIN_PCT) & (df["pct"] <= MAX_PCT) &
-        (df["amount"] >= MIN_AMOUNT) &
-        (df["lb"] >= MIN_LB) & (df["lb"] <= MAX_LB) &
-        (df["turnover"] >= MIN_TURNOVER) & (df["turnover"] <= MAX_TURNOVER) &
-        (df["amplitude"] >= MIN_AMPLITUDE) & (df["amplitude"] <= MAX_AMPLITUDE) &
-        (df["open_pct"] <= MAX_OPEN_PCT)
+        (df["price"]>=MIN_PRICE) & (df["price"]<=MAX_PRICE) &
+        (df["pct"]>=EARLY_MIN_PCT) & (df["pct"]<=MAX_PCT) &
+        (df["amount"]>=MIN_AMOUNT) &
+        (df["lb"]>=MIN_LB) & (df["lb"]<=MAX_LB) &
+        (df["turnover"]>=MIN_TURNOVER) & (df["turnover"]<=MAX_TURNOVER) &
+        (df["amplitude"]>=MIN_AMPLITUDE) & (df["amplitude"]<=MAX_AMPLITUDE) &
+        (df["open_pct"]<=MAX_OPEN_PCT)
     ].copy()
     if CONSECUTIVE_UP_ENABLED:
         filtered = filtered[filtered["code"].apply(has_consecutive_mild_up)]
@@ -485,192 +403,155 @@ if in_morning:
 else:
     filtered = pd.DataFrame()
 
+# 尾盘防御
 if (filtered.empty and not in_morning) or in_afternoon:
     logging.info("切换到尾盘防御模式...")
-    filtered_eod = df[
-        (df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE) &
-        (df["pct"] >= EOD_MIN_PCT) & (df["pct"] <= EOD_MAX_PCT) &
-        (df["amount"] >= MIN_AMOUNT) &
-        (df["lb"] >= EOD_MIN_LB) & (df["lb"] <= EOD_MAX_LB) &
-        (df["turnover"] <= EOD_MAX_TURNOVER) &
-        (df["amplitude"] <= EOD_MAX_AMPLITUDE)
+    filtered = df[
+        (df["price"]>=MIN_PRICE) & (df["price"]<=MAX_PRICE) &
+        (df["pct"]>=EOD_MIN_PCT) & (df["pct"]<=EOD_MAX_PCT) &
+        (df["amount"]>=MIN_AMOUNT) &
+        (df["lb"]>=EOD_MIN_LB) & (df["lb"]<=EOD_MAX_LB) &
+        (df["turnover"]<=EOD_MAX_TURNOVER) &
+        (df["amplitude"]<=EOD_MAX_AMPLITUDE)
     ].copy()
-    if CONSECUTIVE_UP_ENABLED:
-        filtered_eod = filtered_eod[filtered_eod["code"].apply(has_consecutive_mild_up)]
-    filtered = filtered_eod
+    if CONSECUTIVE_UP_ENABLED: filtered = filtered[filtered["code"].apply(has_consecutive_mild_up)]
     logging.info(f"尾盘筛选 {len(filtered)} 只")
 
-# 新增过滤：均线、资金、跌停
+# ===== 核心健壮性修复：后续过滤增加空集保护，避免KeyError =====
+if filtered.empty:
+    logging.info("初筛无标的，空仓退出")
+    sys.exit(0)
+
+# 确保 'code' 列存在（防御性检查）
+if 'code' not in filtered.columns:
+    logging.error("错误：filtered 缺失 'code' 列，终止流程")
+    sys.exit(1)
+
+# 新增过滤
 if INDIVIDUAL_MA_FILTER:
     filtered = filtered[filtered["code"].apply(lambda x: is_above_ma(x, MA_PERIOD))]
     logging.info(f"均线过滤后 {len(filtered)} 只")
+    if filtered.empty:
+        logging.info("均线过滤后无标的，退出"); sys.exit(0)
+
 if MAIN_INFLOW_FILTER:
     filtered = filtered[filtered["code"].apply(has_main_inflow)]
-    logging.info(f"主力净流入过滤后 {len(filtered)} 只")
+    logging.info(f"主力资金过滤后 {len(filtered)} 只")
+    if filtered.empty:
+        logging.info("主力资金过滤后无标的，退出"); sys.exit(0)
+
 if RECENT_LIMIT_DOWN_FILTER:
     filtered = filtered[~filtered["code"].apply(has_recent_limit_down)]
-    logging.info(f"近期跌停过滤后 {len(filtered)} 只")
-
-if filtered.empty:
-    logging.info("无标的，空仓")
-    sys.exit(0)
+    logging.info(f"近跌停过滤后 {len(filtered)} 只")
+    if filtered.empty:
+        logging.info("近跌停过滤后无标的，退出"); sys.exit(0)
 
 # 实时评分
 filtered["realtime_score"] = (
-    filtered["pct"] * 1.3 +
-    filtered["lb"] * 2.0 +
-    (filtered["amount"] / 1e8) * 0.7 +
-    filtered["turnover"] * 0.7 -
-    filtered["amplitude"] * 0.4 -
-    filtered["open_pct"].fillna(0) * 0.5
+    filtered["pct"]*1.3 + filtered["lb"]*2.0 + (filtered["amount"]/1e8)*0.7 +
+    filtered["turnover"]*0.7 - filtered["amplitude"]*0.4 - filtered["open_pct"].fillna(0)*0.5
 )
-
 candidates = filtered.sort_values("realtime_score", ascending=False).head(TOP_N_CANDIDATES).copy()
 
 # 逐个回测
 history_rows, valid_idx = [], []
 for idx, row in candidates.iterrows():
     code = str(row["code"])
-    if FUNDAMENTAL_CHECK and not has_safe_fundamentals(code):
-        continue
+    if FUNDAMENTAL_CHECK and not has_safe_fundamentals(code): continue
     time.sleep(0.3)
     hist_res = evaluate_stock_history(code)
     history_rows.append(hist_res)
     valid_idx.append(idx)
-
 if not valid_idx:
-    logging.info("基本面/历史样本不足，空仓")
-    sys.exit(0)
+    logging.info("基本面/历史样本不足，空仓退出"); sys.exit(0)
 
 candidates = candidates.loc[valid_idx].reset_index(drop=True)
 candidates = pd.concat([candidates, pd.DataFrame(history_rows)], axis=1)
 candidates = candidates[candidates["signals"] >= BACKTEST_MIN_SIGNALS].copy()
 if candidates.empty:
-    logging.info("历史样本不足，空仓")
-    sys.exit(0)
+    logging.info("历史样本不足，空仓退出"); sys.exit(0)
 
-# 分位数归一化
 candidates["norm_real"] = quantile_norm(candidates["realtime_score"])
 candidates["norm_hist"] = quantile_norm(candidates["history_score"])
-candidates["final_score"] = candidates["norm_real"] * 0.28 + candidates["norm_hist"] * 0.72 * 100
-
+candidates["final_score"] = candidates["norm_real"]*0.28 + candidates["norm_hist"]*0.72*100
 candidates = candidates[candidates["final_score"] >= MIN_SCORE_THRESHOLD]
 candidates = candidates.sort_values("final_score", ascending=False).reset_index(drop=True)
-
 if candidates.empty:
-    logging.info("评分不足，空仓")
-    sys.exit(0)
+    logging.info("评分不足，空仓退出"); sys.exit(0)
 
-# 选出最多 FINAL_HOLDINGS 只
 final_candidates = candidates.head(FINAL_HOLDINGS).copy()
 
-# 计算每只推荐的具体交易计划
+# 生成交易计划
 trade_plans = []
 for _, stock in final_candidates.iterrows():
     p = safe_float(stock["price"])
     buy_ref = round(p * LOW_BUY_RATIO, 2)
-    stop = round(buy_ref * (1 + HARD_STOP_RATIO), 2)
+    stop = round(buy_ref * (1+HARD_STOP_RATIO), 2)
     target_min = calc_target_sell_price(buy_ref, FIX_AMOUNT, NET_PROFIT_TARGET_MIN)
     target_max = calc_target_sell_price(buy_ref, FIX_AMOUNT, NET_PROFIT_TARGET_MAX)
     net_min = round(calc_net_profit(target_min, buy_ref, FIX_AMOUNT), 2)
     net_max = round(calc_net_profit(target_max, buy_ref, FIX_AMOUNT), 2)
     net_stop = round(calc_net_profit(stop, buy_ref, FIX_AMOUNT), 2)
-
-    # 简单 ATR 止损参考（14日）
     atr_stop = None
     try:
         hist_atr = ak.stock_zh_a_hist(symbol=stock["code"], period="daily",
-                                      start_date=(now - timedelta(days=30)).strftime("%Y%m%d"),
+                                      start_date=(now-timedelta(days=30)).strftime("%Y%m%d"),
                                       end_date=today, adjust="qfq")
         if hist_atr is not None and not hist_atr.empty:
-            high = hist_atr["最高"].astype(float)
-            low = hist_atr["最低"].astype(float)
+            high = hist_atr["最高"].astype(float); low = hist_atr["最低"].astype(float)
             close_atr = hist_atr["收盘"].astype(float)
-            tr = np.maximum(high - low, np.abs(high - close_atr.shift(1)), np.abs(low - close_atr.shift(1)))
+            tr = np.maximum(high-low, np.abs(high-close_atr.shift(1)), np.abs(low-close_atr.shift(1)))
             atr14 = tr.tail(14).mean()
-            if not np.isnan(atr14):
-                atr_stop = round(buy_ref - 1.5 * atr14, 2)
-    except:
-        pass
-
+            if not np.isnan(atr14): atr_stop = round(buy_ref - 1.5*atr14, 2)
+    except: pass
     trade_plans.append({
-        "name": stock["name"],
-        "code": stock["code"],
-        "price": p,
-        "buy_ref": buy_ref,
-        "stop_hard": stop,
-        "stop_atr": atr_stop,
-        "target_min": target_min,
-        "target_max": target_max,
-        "net_min": net_min,
-        "net_max": net_max,
-        "net_stop": net_stop,
-        "signals": int(stock["signals"]),
-        "win_rate": safe_float(stock["win_rate"]),
+        "name": stock["name"], "code": stock["code"], "price": p,
+        "buy_ref": buy_ref, "stop_hard": stop, "stop_atr": atr_stop,
+        "target_min": target_min, "target_max": target_max,
+        "net_min": net_min, "net_max": net_max, "net_stop": net_stop,
+        "signals": int(stock["signals"]), "win_rate": safe_float(stock["win_rate"]),
         "hit_250": safe_float(stock["target_250_hit_rate"]),
         "hit_350": safe_float(stock["target_350_hit_rate"]),
-        "final_score": safe_float(stock["final_score"]),
-        "market_pct": market_pct
+        "final_score": safe_float(stock["final_score"]), "market_pct": market_pct
     })
 
-# 推送内容
+# 推送
 push_lines = [f"## {today} 低吸稳赢 · 组合推荐", ""]
 push_lines.append(f"- **大盘涨跌**：{market_pct:+.2f}%")
 push_lines.append(f"- **建议总仓位**：{suggested_position_ratio*100:.0f}%")
-push_lines.append("- **止盈策略**：达标止盈 / 移动止盈（回撤1%离场）")
-push_lines.append("")
-
+push_lines.append("- **止盈策略**：达标止盈 / 移动止盈（回撤1%离场）\n")
 for plan in trade_plans:
     push_lines.append(f"### {plan['name']}({plan['code']})")
     push_lines.append(f"- 现价：{plan['price']:.2f}")
     push_lines.append(f"- 低吸参考：{plan['buy_ref']}")
     push_lines.append(f"- 止盈区间：{plan['target_min']} ~ {plan['target_max']}")
-    push_lines.append(f"- 硬止损：{plan['stop_hard']}" +
-                     (f" / ATR止损：{plan['stop_atr']}" if plan['stop_atr'] else ""))
+    stop_info = f"- 硬止损：{plan['stop_hard']}" + (f" / ATR止损：{plan['stop_atr']}" if plan['stop_atr'] else "")
+    push_lines.append(stop_info)
     push_lines.append(f"- 预估净利：{plan['net_min']} ~ {plan['net_max']} 元")
     push_lines.append(f"- 止损亏损：{plan['net_stop']} 元")
-    push_lines.append(f"- 历史信号：{plan['signals']}次 | 胜率：{plan['win_rate']:.1f}% | "
-                     f"250命中：{plan['hit_250']:.1f}% | 350命中：{plan['hit_350']:.1f}%")
-    push_lines.append("")
+    push_lines.append(f"- 信号：{plan['signals']}次 | 胜率：{plan['win_rate']:.1f}% | "
+                     f"250命中：{plan['hit_250']:.1f}% | 350命中：{plan['hit_350']:.1f}%\n")
+push("\n".join(push_lines).strip())
+for plan in trade_plans: print(f"推荐 {plan['name']}({plan['code']}) 买入参考 {plan['buy_ref']}")
 
-content = "\n".join(push_lines).strip()
-push("低吸稳赢组合推荐", content)
-
-for plan in trade_plans:
-    print(f"推荐 {plan['name']}({plan['code']}) 买入参考 {plan['buy_ref']}")
-
-# 日志记录（记录全部推荐）
+# 日志
 log_file = "trade_log.csv"
 file_exists = os.path.isfile(log_file)
 try:
     with open(log_file, "a", newline="", encoding="utf-8-sig") as f:
         writer = None
         for plan in trade_plans:
-            log_row = {
-                "date": today,
-                "time_window": "morning" if in_morning else "afternoon",
-                "code": plan["code"],
-                "name": plan["name"],
-                "price": plan["price"],
-                "buy_ref": plan["buy_ref"],
-                "stop_hard": plan["stop_hard"],
-                "stop_atr": plan["stop_atr"],
-                "target_min": plan["target_min"],
-                "target_max": plan["target_max"],
-                "net_min": plan["net_min"],
-                "net_max": plan["net_max"],
-                "signals": plan["signals"],
-                "win_rate": plan["win_rate"],
-                "hit_250": plan["hit_250"],
-                "hit_350": plan["hit_350"],
-                "final_score": plan["final_score"],
-                "market_pct": market_pct,
-                "position_ratio": suggested_position_ratio
-            }
+            log_row = {"date": today, "time_window": "morning" if in_morning else "afternoon",
+                       "code": plan["code"], "name": plan["name"], "price": plan["price"],
+                       "buy_ref": plan["buy_ref"], "stop_hard": plan["stop_hard"], "stop_atr": plan["stop_atr"],
+                       "target_min": plan["target_min"], "target_max": plan["target_max"],
+                       "net_min": plan["net_min"], "net_max": plan["net_max"], "signals": plan["signals"],
+                       "win_rate": plan["win_rate"], "hit_250": plan["hit_250"], "hit_350": plan["hit_350"],
+                       "final_score": plan["final_score"], "market_pct": market_pct,
+                       "position_ratio": suggested_position_ratio}
             if writer is None:
                 writer = csv.DictWriter(f, fieldnames=list(log_row.keys()))
-                if not file_exists:
-                    writer.writeheader()
+                if not file_exists: writer.writeheader()
             writer.writerow(log_row)
     logging.info(f"日志已写入 {log_file}")
 except Exception as e:
