@@ -15,7 +15,7 @@ import requests
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# ==================== 可调节配置 ====================
+# ==================== 配置 ====================
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
 TEST_MODE = os.getenv("TEST_MODE", "1") == "1"
 
@@ -43,7 +43,6 @@ MA20_FILTER = False
 SECTOR_FILTER_ENABLED = False
 CONSECUTIVE_UP_ENABLED = False
 
-# ---------- 新增强化过滤 ----------
 INDIVIDUAL_MA_FILTER = True
 MA_PERIOD = 20
 MAIN_INFLOW_FILTER = True
@@ -79,7 +78,6 @@ today = now.strftime("%Y%m%d")
 week_num = now.weekday()
 current_hour = now.hour + now.minute / 60.0
 
-# 用于新浪数据量比放宽的临时变量（动态修改）
 MIN_LB_DYNAMIC, MAX_LB_DYNAMIC = MIN_LB, MAX_LB
 EOD_MIN_LB_DYNAMIC, EOD_MAX_LB_DYNAMIC = EOD_MIN_LB, EOD_MAX_LB
 
@@ -320,7 +318,7 @@ def quantile_norm(series, n_quantiles=5):
         return series.apply(map_q)
     except: return (series-series.min())/(series.max()-series.min()+1e-9)
 
-# ---------- 增强版行情获取 ----------
+# ---------- 行情获取 ----------
 def fetch_spot_data():
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     for attempt in range(1, 4):
@@ -395,10 +393,10 @@ def _generate_historical_snapshot():
                 df["lb"] = raw.get("量比", pd.Series([1.0]*len(raw))).astype(float)
                 df["turnover"] = raw["换手率"].astype(float); df["amplitude"] = raw["振幅"].astype(float)
                 df["open"] = raw["今开"].astype(float); df["prev_close"] = raw["昨收"].astype(float)
-                logging.info("历史快照模拟成功（基于最新缓存）")
+                logging.info("历史快照模拟成功")
                 return df
         except: pass
-        logging.error("无法生成历史快照，请手动指定交易日期运行")
+        logging.error("无法生成历史快照")
         return pd.DataFrame()
     except Exception as e:
         logging.error(f"历史快照异常: {e}")
@@ -412,15 +410,13 @@ if not TEST_MODE:
         logging.info("非允许交易时段，退出")
         sys.exit(0)
 else:
-    # 测试模式根据真实时间，但非交易时段强制尾盘模式（更易出候选）
     in_morning = (week_num in TRADE_WEEKDAYS) and (MORNING_START <= current_hour < MORNING_END)
     in_afternoon = (week_num in TRADE_WEEKDAYS) and (AFTERNOON_START <= current_hour < AFTERNOON_END)
     if not (in_morning or in_afternoon):
         in_morning = False
         in_afternoon = True
-        logging.info("测试模式：当前非交易时段，强制启用尾盘防御模式")
+        logging.info("测试模式：非交易时段，强制启用尾盘防御模式")
 
-# 仓位建议
 suggested_position_ratio = 0.6
 if MA20_FILTER:
     _, _, ma_safe = get_market_ma20_safe()
@@ -440,9 +436,11 @@ if raw_df.empty:
     logging.error("行情获取失败，退出")
     sys.exit(0)
 
-# 🔍 智能检测新浪数据量比缺陷
+# 新浪数据检测
+is_sina_data = False
 if raw_df is not None and not raw_df.empty and 'lb' in raw_df.columns:
     if raw_df['lb'].nunique() == 1 and raw_df['lb'].iloc[0] == 1.0:
+        is_sina_data = True
         logging.warning("检测到量比数据全部为1.0（新浪数据），自动放宽量比限制")
         MIN_LB_DYNAMIC, MAX_LB_DYNAMIC = 0.5, 5.0
         EOD_MIN_LB_DYNAMIC, EOD_MAX_LB_DYNAMIC = 0.5, 5.0
@@ -483,7 +481,7 @@ if SECTOR_FILTER_ENABLED:
     except Exception as e:
         logging.warning(f"板块过滤失败: {e}")
 
-# 早盘筛选（使用动态量比）
+# 早盘
 if in_morning:
     filtered = df[
         (df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE) &
@@ -500,7 +498,7 @@ if in_morning:
 else:
     filtered = pd.DataFrame()
 
-# 尾盘防御模式
+# 尾盘 + fallback
 if (filtered.empty and not in_morning) or in_afternoon:
     logging.info("切换到尾盘防御模式...")
     filtered = df[
@@ -511,31 +509,42 @@ if (filtered.empty and not in_morning) or in_afternoon:
         (df["turnover"] <= EOD_MAX_TURNOVER) &
         (df["amplitude"] <= EOD_MAX_AMPLITUDE)
     ].copy()
-    if CONSECUTIVE_UP_ENABLED: filtered = filtered[filtered["code"].apply(has_consecutive_mild_up)]
+    if CONSECUTIVE_UP_ENABLED:
+        filtered = filtered[filtered["code"].apply(has_consecutive_mild_up)]
     logging.info(f"尾盘筛选 {len(filtered)} 只")
+
+    # fallback: 若仍然为0且为新浪数据，则进一步放宽
+    if filtered.empty and is_sina_data:
+        logging.warning("尾盘筛选空，启用新浪数据fallback：放宽涨跌幅至-3%~3%，忽略换手率/振幅")
+        filtered = df[
+            (df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE) &
+            (df["pct"] >= -3.0) & (df["pct"] <= 3.0) &
+            (df["amount"] >= MIN_AMOUNT) &
+            (df["lb"] >= 0.5) & (df["lb"] <= 5.0)
+        ].copy()
+        logging.info(f"fallback筛选 {len(filtered)} 只")
 
 if filtered.empty:
     logging.info("初筛无标的，空仓退出")
     sys.exit(0)
 
 if 'code' not in filtered.columns:
-    logging.error("错误：filtered 缺失 'code' 列，终止流程")
+    logging.error("filtered 缺失 'code' 列")
     sys.exit(1)
 
+# 后续增强过滤
 if INDIVIDUAL_MA_FILTER:
     filtered = filtered[filtered["code"].apply(lambda x: is_above_ma(x, MA_PERIOD))]
     logging.info(f"均线过滤后 {len(filtered)} 只")
-    if filtered.empty: logging.info("均线过滤后无标的，退出"); sys.exit(0)
-
+    if filtered.empty: logging.info("退出"); sys.exit(0)
 if MAIN_INFLOW_FILTER:
     filtered = filtered[filtered["code"].apply(has_main_inflow)]
     logging.info(f"主力资金过滤后 {len(filtered)} 只")
-    if filtered.empty: logging.info("主力资金过滤后无标的，退出"); sys.exit(0)
-
+    if filtered.empty: logging.info("退出"); sys.exit(0)
 if RECENT_LIMIT_DOWN_FILTER:
     filtered = filtered[~filtered["code"].apply(has_recent_limit_down)]
     logging.info(f"近跌停过滤后 {len(filtered)} 只")
-    if filtered.empty: logging.info("近跌停过滤后无标的，退出"); sys.exit(0)
+    if filtered.empty: logging.info("退出"); sys.exit(0)
 
 filtered["realtime_score"] = (
     filtered["pct"]*1.3 + filtered["lb"]*2.0 + (filtered["amount"]/1e8)*0.7 +
@@ -552,19 +561,19 @@ for idx, row in candidates.iterrows():
     history_rows.append(hist_res)
     valid_idx.append(idx)
 
-if not valid_idx: logging.info("基本面/历史样本不足，空仓退出"); sys.exit(0)
+if not valid_idx: logging.info("基本面/历史样本不足，退出"); sys.exit(0)
 
 candidates = candidates.loc[valid_idx].reset_index(drop=True)
 candidates = pd.concat([candidates, pd.DataFrame(history_rows)], axis=1)
 candidates = candidates[candidates["signals"] >= BACKTEST_MIN_SIGNALS].copy()
-if candidates.empty: logging.info("历史样本不足，空仓退出"); sys.exit(0)
+if candidates.empty: logging.info("历史样本不足，退出"); sys.exit(0)
 
 candidates["norm_real"] = quantile_norm(candidates["realtime_score"])
 candidates["norm_hist"] = quantile_norm(candidates["history_score"])
 candidates["final_score"] = candidates["norm_real"]*0.28 + candidates["norm_hist"]*0.72*100
 candidates = candidates[candidates["final_score"] >= MIN_SCORE_THRESHOLD]
 candidates = candidates.sort_values("final_score", ascending=False).reset_index(drop=True)
-if candidates.empty: logging.info("评分不足，空仓退出"); sys.exit(0)
+if candidates.empty: logging.info("评分不足，退出"); sys.exit(0)
 
 final_candidates = candidates.head(FINAL_HOLDINGS).copy()
 
@@ -604,7 +613,10 @@ for _, stock in final_candidates.iterrows():
 push_lines = [f"## {today} 低吸稳赢 · 组合推荐", ""]
 push_lines.append(f"- **大盘涨跌**：{market_pct:+.2f}%")
 push_lines.append(f"- **建议总仓位**：{suggested_position_ratio*100:.0f}%")
-push_lines.append("- **止盈策略**：达标止盈 / 移动止盈（回撤1%离场）\n")
+push_lines.append("- **止盈策略**：达标止盈 / 移动止盈（回撤1%离场）")
+if is_sina_data:
+    push_lines.append("- ⚠️ 数据源：新浪（部分字段缺失，条件已放宽）")
+push_lines.append("")
 for plan in trade_plans:
     push_lines.append(f"### {plan['name']}({plan['code']})")
     push_lines.append(f"- 现价：{plan['price']:.2f}")
