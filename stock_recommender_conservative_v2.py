@@ -320,7 +320,6 @@ def quantile_norm(series, n_quantiles=5):
 
 # ---------- 行情获取 ----------
 def fetch_spot_data():
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     for attempt in range(1, 4):
         try:
             logging.info(f"东方财富实时行情，第{attempt}次尝试...")
@@ -513,16 +512,41 @@ if (filtered.empty and not in_morning) or in_afternoon:
         filtered = filtered[filtered["code"].apply(has_consecutive_mild_up)]
     logging.info(f"尾盘筛选 {len(filtered)} 只")
 
-    # fallback: 若仍然为0且为新浪数据，则进一步放宽
     if filtered.empty and is_sina_data:
-        logging.warning("尾盘筛选空，启用新浪数据fallback：放宽涨跌幅至-3%~3%，忽略换手率/振幅")
+        # 诊断输出
+        logging.warning("尾盘空，开始数据诊断...")
+        price_ok = len(df[(df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE)])
+        amount_ok = len(df[df["amount"] >= MIN_AMOUNT])
+        pct_range = len(df[(df["pct"] >= -3) & (df["pct"] <= 3)])
+        diag_msg = (f"## 数据诊断 ({today})\n"
+                    f"- 数据源：新浪\n"
+                    f"- 价格8~30元：{price_ok} 只\n"
+                    f"- 成交额≥1.5亿：{amount_ok} 只\n"
+                    f"- 涨跌幅-3%~3%：{pct_range} 只\n"
+                    f"- 价格min/max：{df['price'].min():.2f}/{df['price'].max():.2f}\n"
+                    f"- 成交额min/max：{df['amount'].min():.0f}/{df['amount'].max():.0f}\n"
+                    f"- 涨跌幅min/max：{df['pct'].min():.2f}%/{df['pct'].max():.2f}%")
+        push("选股系统数据诊断", diag_msg)
+
+        # fallback：放宽涨跌幅-3~3%，忽略换手率/振幅，仍保留成交额
+        logging.warning("启用新浪fallback：涨跌幅-3%~3%")
         filtered = df[
             (df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE) &
-            (df["pct"] >= -3.0) & (df["pct"] <= 3.0) &
+            (df["pct"] >= -3) & (df["pct"] <= 3) &
             (df["amount"] >= MIN_AMOUNT) &
             (df["lb"] >= 0.5) & (df["lb"] <= 5.0)
         ].copy()
         logging.info(f"fallback筛选 {len(filtered)} 只")
+
+        # 如果仍然空，尝试完全忽略成交额（只要>0）
+        if filtered.empty:
+            logging.warning("最终兜底：取消成交额限制")
+            filtered = df[
+                (df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE) &
+                (df["pct"] >= -10) & (df["pct"] <= 10) &
+                (df["amount"] > 0)
+            ].copy()
+            logging.info(f"最终兜底筛选 {len(filtered)} 只")
 
 if filtered.empty:
     logging.info("初筛无标的，空仓退出")
