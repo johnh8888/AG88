@@ -49,26 +49,29 @@ MAIN_INFLOW_FILTER = True
 RECENT_LIMIT_DOWN_FILTER = True
 LIMIT_DOWN_LOOKBACK = 5
 
+# ---------- 放宽版筛选参数 ----------
 MIN_PRICE, MAX_PRICE = 8, 30
-EARLY_MIN_PCT = 0.8
-MIN_AMOUNT = 1.5e8
-MIN_LB, MAX_LB = 1.0, 2.5
-MIN_TURNOVER, MAX_TURNOVER = 2.0, 9.0
-MIN_AMPLITUDE, MAX_AMPLITUDE = 1.8, 7.0
-MAX_OPEN_PCT = 2.0
+EARLY_MIN_PCT = 0.3
+MIN_AMOUNT = 1.0e8
+MIN_LB, MAX_LB = 0.8, 3.0
+MIN_TURNOVER, MAX_TURNOVER = 1.0, 9.0
+MIN_AMPLITUDE, MAX_AMPLITUDE = 1.0, 7.0
+MAX_OPEN_PCT = 2.5
 MAX_PCT = 5.5
 
-EOD_MAX_PCT = 1.8
-EOD_MIN_PCT = -0.5
-EOD_MAX_TURNOVER = 4.5
-EOD_MIN_LB, EOD_MAX_LB = 0.9, 1.5
-EOD_MAX_AMPLITUDE = 3.5
+# 尾盘条件放宽
+EOD_MAX_PCT = 2.5
+EOD_MIN_PCT = -1.5
+EOD_MAX_TURNOVER = 5.5
+EOD_MIN_LB, EOD_MAX_LB = 0.7, 2.0
+EOD_MAX_AMPLITUDE = 4.0
 
-MIN_SCORE_THRESHOLD = 7.0
+# 评分与样本放宽
+MIN_SCORE_THRESHOLD = 5.5
 TOP_N_CANDIDATES = 5
 FINAL_HOLDINGS = 3
 BACKTEST_LOOKBACK_DAYS = 180
-BACKTEST_MIN_SIGNALS = 3
+BACKTEST_MIN_SIGNALS = 2
 MIN_CONSECUTIVE_UP = 3
 FUNDAMENTAL_CHECK = True
 
@@ -480,7 +483,7 @@ if SECTOR_FILTER_ENABLED:
     except Exception as e:
         logging.warning(f"板块过滤失败: {e}")
 
-# 早盘
+# 早盘筛选
 if in_morning:
     filtered = df[
         (df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE) &
@@ -497,7 +500,7 @@ if in_morning:
 else:
     filtered = pd.DataFrame()
 
-# 尾盘 + fallback
+# 尾盘 + 增强 fallback
 if (filtered.empty and not in_morning) or in_afternoon:
     logging.info("切换到尾盘防御模式...")
     filtered = df[
@@ -513,22 +516,21 @@ if (filtered.empty and not in_morning) or in_afternoon:
     logging.info(f"尾盘筛选 {len(filtered)} 只")
 
     if filtered.empty and is_sina_data:
-        # 诊断输出
-        logging.warning("尾盘空，开始数据诊断...")
+        logging.warning("尾盘空，开始数据诊断及fallback")
         price_ok = len(df[(df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE)])
         amount_ok = len(df[df["amount"] >= MIN_AMOUNT])
         pct_range = len(df[(df["pct"] >= -3) & (df["pct"] <= 3)])
         diag_msg = (f"## 数据诊断 ({today})\n"
                     f"- 数据源：新浪\n"
                     f"- 价格8~30元：{price_ok} 只\n"
-                    f"- 成交额≥1.5亿：{amount_ok} 只\n"
+                    f"- 成交额≥1亿：{amount_ok} 只\n"
                     f"- 涨跌幅-3%~3%：{pct_range} 只\n"
                     f"- 价格min/max：{df['price'].min():.2f}/{df['price'].max():.2f}\n"
                     f"- 成交额min/max：{df['amount'].min():.0f}/{df['amount'].max():.0f}\n"
                     f"- 涨跌幅min/max：{df['pct'].min():.2f}%/{df['pct'].max():.2f}%")
         push("选股系统数据诊断", diag_msg)
 
-        # fallback：放宽涨跌幅-3~3%，忽略换手率/振幅，仍保留成交额
+        # fallback 放宽涨跌幅-3~3%，忽略换手率/振幅，保留成交额
         logging.warning("启用新浪fallback：涨跌幅-3%~3%")
         filtered = df[
             (df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE) &
@@ -538,9 +540,8 @@ if (filtered.empty and not in_morning) or in_afternoon:
         ].copy()
         logging.info(f"fallback筛选 {len(filtered)} 只")
 
-        # 如果仍然空，尝试完全忽略成交额（只要>0）
         if filtered.empty:
-            logging.warning("最终兜底：取消成交额限制")
+            logging.warning("最终兜底：取消成交额限制，仅价格与涨跌幅")
             filtered = df[
                 (df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE) &
                 (df["pct"] >= -10) & (df["pct"] <= 10) &
@@ -556,7 +557,7 @@ if 'code' not in filtered.columns:
     logging.error("filtered 缺失 'code' 列")
     sys.exit(1)
 
-# 后续增强过滤
+# 增强过滤
 if INDIVIDUAL_MA_FILTER:
     filtered = filtered[filtered["code"].apply(lambda x: is_above_ma(x, MA_PERIOD))]
     logging.info(f"均线过滤后 {len(filtered)} 只")
@@ -570,9 +571,10 @@ if RECENT_LIMIT_DOWN_FILTER:
     logging.info(f"近跌停过滤后 {len(filtered)} 只")
     if filtered.empty: logging.info("退出"); sys.exit(0)
 
+# 优化后的实时评分
 filtered["realtime_score"] = (
-    filtered["pct"]*1.3 + filtered["lb"]*2.0 + (filtered["amount"]/1e8)*0.7 +
-    filtered["turnover"]*0.7 - filtered["amplitude"]*0.4 - filtered["open_pct"].fillna(0)*0.5
+    filtered["pct"] * 1.8 + filtered["lb"] * 1.5 + (filtered["amount"] / 1e8) * 1.0 +
+    filtered["turnover"] * 0.8 - filtered["amplitude"] * 0.3 - filtered["open_pct"].fillna(0) * 0.3
 )
 candidates = filtered.sort_values("realtime_score", ascending=False).head(TOP_N_CANDIDATES).copy()
 
@@ -594,7 +596,7 @@ if candidates.empty: logging.info("历史样本不足，退出"); sys.exit(0)
 
 candidates["norm_real"] = quantile_norm(candidates["realtime_score"])
 candidates["norm_hist"] = quantile_norm(candidates["history_score"])
-candidates["final_score"] = candidates["norm_real"]*0.28 + candidates["norm_hist"]*0.72*100
+candidates["final_score"] = candidates["norm_real"] * 0.28 + candidates["norm_hist"] * 0.72 * 100
 candidates = candidates[candidates["final_score"] >= MIN_SCORE_THRESHOLD]
 candidates = candidates.sort_values("final_score", ascending=False).reset_index(drop=True)
 if candidates.empty: logging.info("评分不足，退出"); sys.exit(0)
@@ -605,7 +607,7 @@ trade_plans = []
 for _, stock in final_candidates.iterrows():
     p = safe_float(stock["price"])
     buy_ref = round(p * LOW_BUY_RATIO, 2)
-    stop = round(buy_ref * (1+HARD_STOP_RATIO), 2)
+    stop = round(buy_ref * (1 + HARD_STOP_RATIO), 2)
     target_min = calc_target_sell_price(buy_ref, FIX_AMOUNT, NET_PROFIT_TARGET_MIN)
     target_max = calc_target_sell_price(buy_ref, FIX_AMOUNT, NET_PROFIT_TARGET_MAX)
     net_min = round(calc_net_profit(target_min, buy_ref, FIX_AMOUNT), 2)
@@ -614,14 +616,14 @@ for _, stock in final_candidates.iterrows():
     atr_stop = None
     try:
         hist_atr = ak.stock_zh_a_hist(symbol=stock["code"], period="daily",
-                                      start_date=(now-timedelta(days=30)).strftime("%Y%m%d"),
+                                      start_date=(now - timedelta(days=30)).strftime("%Y%m%d"),
                                       end_date=today, adjust="qfq")
         if hist_atr is not None and not hist_atr.empty:
             high = hist_atr["最高"].astype(float); low = hist_atr["最低"].astype(float)
             close_atr = hist_atr["收盘"].astype(float)
-            tr = np.maximum(high-low, np.abs(high-close_atr.shift(1)), np.abs(low-close_atr.shift(1)))
+            tr = np.maximum(high - low, np.abs(high - close_atr.shift(1)), np.abs(low - close_atr.shift(1)))
             atr14 = tr.tail(14).mean()
-            if not np.isnan(atr14): atr_stop = round(buy_ref - 1.5*atr14, 2)
+            if not np.isnan(atr14): atr_stop = round(buy_ref - 1.5 * atr14, 2)
     except: pass
     trade_plans.append({
         "name": stock["name"], "code": stock["code"], "price": p,
