@@ -1,4 +1,4 @@
-name: V15 Quant System
+name: V15 Stable Quant System
 
 on:
   schedule:
@@ -10,22 +10,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: Upgrade pip
-        run: python -m pip install --upgrade pip
-
-      - name: Install dependencies (safe mode)
+      - name: Install dependencies
         run: |
-          pip install -r requirements.txt || true
-          pip install lightgbm xgboost --no-cache-dir || true
+          python -m pip install --upgrade pip
+          pip install akshare pandas numpy requests
 
-      - name: Run system
+      - name: Run with retry protection
         run: |
-          python run.py
+          for i in 1 2 3; do
+            python run.py && break || sleep 10
+          done
