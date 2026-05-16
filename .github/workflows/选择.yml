@@ -1,9 +1,10 @@
-name: V15 Stable Quant System
+name: V16 Stable Quant
 
 on:
-  schedule:
-    - cron: '0 1 * * *'
+  push:
   workflow_dispatch:
+  schedule:
+    - cron: "0 */6 * * *"
 
 jobs:
   run:
@@ -12,16 +13,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: "3.10"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install akshare pandas numpy requests
+          pip install -r requirements.txt
 
-      - name: Run with retry protection
+      - name: Run system (retry safe)
         run: |
           for i in 1 2 3; do
             python run.py && break || sleep 10
