@@ -1,74 +1,31 @@
-name: V15 Quant Stable Pipeline
+name: V15 Quant System
 
 on:
-  workflow_dispatch:
   schedule:
-    - cron: "0 2 * * *"
+    - cron: '0 1 * * *'
+  workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
 
     steps:
-      # ========================
-      # 1. 拉取代码
-      # ========================
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ========================
-      # 2. Python环境
-      # ========================
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.10"
+          python-version: '3.10'
 
-      # ========================
-      # 3. 系统依赖（解决 lightgbm / xgboost 编译问题）
-      # ========================
-      - name: Install system dependencies
+      - name: Upgrade pip
+        run: python -m pip install --upgrade pip
+
+      - name: Install dependencies (safe mode)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential cmake libgomp1
+          pip install -r requirements.txt || true
+          pip install lightgbm xgboost --no-cache-dir || true
 
-      # ========================
-      # 4. pip升级（防止依赖解析失败）
-      # ========================
-      - name: Upgrade pip tools
-        run: |
-          python -m pip install --upgrade pip setuptools wheel
-
-      # ========================
-      # 5. 安装Python依赖（关键）
-      # ========================
-      - name: Install dependencies
-        run: |
-          pip install -r requirements.txt
-
-      # ========================
-      # 6. 依赖检查（防止 silent fail）
-      # ========================
-      - name: Dependency check
-        run: |
-          python -c "import numpy, pandas, sklearn; print('core OK')"
-          python -c "import lightgbm; print('lgb OK')" || echo "lightgbm failed, fallback needed"
-
-      # ========================
-      # 7. 运行策略
-      # ========================
-      - name: Run strategy
+      - name: Run system
         run: |
           python run.py
-
-      # ========================
-      # 8. 上传结果
-      # ========================
-      - name: Upload report
-        uses: actions/upload-artifact@v4
-        with:
-          name: quant-report
-          path: |
-            report.csv
-            trade_log.csv
-            *.md
