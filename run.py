@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
-# V15.2 QUANT SYSTEM (Zhaowei Edition)
+# V15.3 QUANT SYSTEM (Stable Production Edition)
 
 import time
 import random
 import pandas as pd
 
-print("🚀 V15.2 QUANT SYSTEM START")
+print("🚀 V15.3 QUANT SYSTEM START")
 
 
 # =========================
-# 安全请求封装
+# 1. 安全请求封装
 # =========================
 def safe_call(func, name="data", retries=5):
     for i in range(retries):
@@ -25,7 +25,36 @@ def safe_call(func, name="data", retries=5):
 
 
 # =========================
-# A股数据（平安银行）
+# 2. 数据标准化（核心修复）
+# =========================
+def normalize(df):
+    """
+    统一所有数据源字段 -> close
+    """
+
+    if df is None or len(df) == 0:
+        return None
+
+    # 已存在标准字段
+    if "close" in df.columns:
+        return df
+
+    # 常见中文字段兼容
+    for col in df.columns:
+        if col in ["收盘", "收盘价", "close"]:
+            df = df.rename(columns={col: "close"})
+            return df
+
+    # fallback：AKShare结构兜底（通常第5列是收盘）
+    try:
+        df["close"] = df.iloc[:, 4]
+        return df
+    except:
+        return None
+
+
+# =========================
+# 3. A股数据
 # =========================
 def get_a_stock():
     import akshare as ak
@@ -40,14 +69,14 @@ def get_a_stock():
     df = safe_call(fetch, "A股数据")
 
     if df is None:
-        print("⚠️ A股数据失败，切备用数据")
+        print("⚠️ A股失败 -> fallback")
         df = pd.DataFrame({"close": [3000, 3050, 3020, 3100, 3080]})
 
-    return df
+    return normalize(df)
 
 
 # =========================
-# 兆威机电（替代港股腾讯）
+# 4. 兆威机电（替代港股）
 # =========================
 def get_zhaowei():
     import akshare as ak
@@ -62,20 +91,31 @@ def get_zhaowei():
     df = safe_call(fetch, "兆威机电")
 
     if df is None:
-        print("⚠️ 兆威机电数据失败，使用 fallback")
+        print("⚠️ 兆威机电失败 -> fallback")
         df = pd.DataFrame({"close": [80, 82, 79, 85, 88]})
 
-    return df
+    return normalize(df)
 
 
 # =========================
-# 策略模型
+# 5. 策略模型（防崩版）
 # =========================
 def strategy(df, name):
-    if df is None or len(df) < 3:
+
+    if df is None or "close" not in df.columns:
         return {"symbol": name, "signal": "NO_DATA", "score": 0}
 
-    score = (df["close"].iloc[-1] - df["close"].iloc[0]) / df["close"].iloc[0] * 100
+    close = df["close"]
+
+    try:
+        close = close.astype(float)
+    except:
+        return {"symbol": name, "signal": "NO_DATA", "score": 0}
+
+    if len(close) < 3:
+        return {"symbol": name, "signal": "NO_DATA", "score": 0}
+
+    score = (close.iloc[-1] - close.iloc[0]) / close.iloc[0] * 100
 
     if score > 2:
         signal = "BUY"
@@ -84,11 +124,15 @@ def strategy(df, name):
     else:
         signal = "HOLD"
 
-    return {"symbol": name, "signal": signal, "score": round(score, 3)}
+    return {
+        "symbol": name,
+        "signal": signal,
+        "score": round(score, 3)
+    }
 
 
 # =========================
-# 主逻辑
+# 6. 主逻辑
 # =========================
 def main():
 
@@ -102,17 +146,23 @@ def main():
     results.append(strategy(a_df, "A 000300"))
     results.append(strategy(z_df, "A 003021 兆威机电"))
 
-    print("\n===== V15.2 交易信号 =====")
+    print("\n===== V15.3 交易信号 =====")
 
     buy = 0
+    sell = 0
+
     for r in results:
         print(f"{r['symbol']} | {r['signal']} | score={r['score']}")
+
         if r["signal"] == "BUY":
             buy += 1
+        if r["signal"] == "SELL":
+            sell += 1
 
     print("\n===== 风控输出 =====")
     print(f"信号数量: {len(results)}")
     print(f"买入信号: {buy}")
+    print(f"卖出信号: {sell}")
 
     if buy == 0:
         print("❌ 当前无交易机会（系统风控过滤）")
