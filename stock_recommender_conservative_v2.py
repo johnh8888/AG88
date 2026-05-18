@@ -255,11 +255,13 @@ def summarize_recommendation_quality(df_candidates):
         "avg_win_rate": float(df_candidates["win_rate"].mean()) if "win_rate" in df_candidates.columns else 0.0,
         "avg_net_min": float(df_candidates["net_min"].mean()) if "net_min" in df_candidates.columns else 0.0,
     }
-+
-+
-+def log_run_mode():
-+    logging.info(f"运行模式：{RUN_MODE}")
-+    logging.info(f"实时推送：{'开启' if ENABLE_LIVE_PUSH else '关闭'}")
+
+
+def log_run_mode():
+    logging.info(f"运行模式：{RUN_MODE}")
+    logging.info(f"实时推送：{'开启' if ENABLE_LIVE_PUSH else '关闭'}")
+
+
 def get_next_trade_day_text(base_dt):
     try:
         trade_cal = ak.tool_trade_date_hist_sina()
