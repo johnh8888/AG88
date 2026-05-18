@@ -19,6 +19,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
 TEST_MODE = os.getenv("TEST_MODE", "1") == "1"
 RUN_MODE = os.getenv("RUN_MODE", "diagnostic").lower()  # diagnostic / paper / live
+ENABLE_LIVE_PUSH = RUN_MODE == "live" and bool(PUSHPLUS_TOKEN)
 
 TOTAL_CAPITAL = 20000
 TRADE_RATIO = 0.6
@@ -73,7 +74,7 @@ EOD_MAX_AMPLITUDE = 4.0
 
 # 评分与样本放宽
 MIN_SCORE_THRESHOLD = 5.5
-TOP_N_CANDIDATES = 5
+TOP_N_CANDIDATES = 3
 FINAL_HOLDINGS = 3
 BACKTEST_LOOKBACK_DAYS = 180
 BACKTEST_MIN_SIGNALS = 2
@@ -96,7 +97,7 @@ EOD_MIN_LB_DYNAMIC, EOD_MAX_LB_DYNAMIC = EOD_MIN_LB, EOD_MAX_LB
 
 # ---------- 工具函数 ----------
 def push(title, content):
-    if PUSHPLUS_TOKEN:
+    if ENABLE_LIVE_PUSH:
         try:
             requests.post("http://www.pushplus.plus/send",
                           json={"token": PUSHPLUS_TOKEN, "title": title,
@@ -208,6 +209,14 @@ def get_dynamic_exit_prices(entry_price, capital):
     }
 
 
+def log_stage_summary(stage_name, df_or_count, note=""):
+    count = len(df_or_count) if hasattr(df_or_count, "__len__") and not isinstance(df_or_count, (int, float)) else int(df_or_count)
+    msg = f"{stage_name}: {count} 只"
+    if note:
+        msg += f" | {note}"
+    logging.info(msg)
+
+
 def record_filter_diag(diag, stage, before, after, note=""):
     diag.append({"stage": stage, "before": before, "after": after, "drop": before - after, "note": note})
 
@@ -223,6 +232,34 @@ def log_filter_diag(diag):
         logging.info(msg)
     logging.info("========================")
 
+
+def timed_call(func, timeout_seconds=12, default=None, *args, **kwargs):
+    start = time.time()
+    try:
+        result = func(*args, **kwargs)
+        elapsed = time.time() - start
+        if elapsed > timeout_seconds:
+            logging.warning(f"{func.__name__} 耗时 {elapsed:.1f}s，已超过建议阈值 {timeout_seconds}s")
+        return result
+    except Exception as e:
+        logging.debug(f"{func.__name__} 调用失败: {e}")
+        return default
+
+
+def summarize_recommendation_quality(df_candidates):
+    if df_candidates is None or df_candidates.empty:
+        return {"count": 0, "avg_final_score": 0.0, "avg_win_rate": 0.0, "avg_net_min": 0.0}
+    return {
+        "count": int(len(df_candidates)),
+        "avg_final_score": float(df_candidates["final_score"].mean()),
+        "avg_win_rate": float(df_candidates["win_rate"].mean()) if "win_rate" in df_candidates.columns else 0.0,
+        "avg_net_min": float(df_candidates["net_min"].mean()) if "net_min" in df_candidates.columns else 0.0,
+    }
++
++
++def log_run_mode():
++    logging.info(f"运行模式：{RUN_MODE}")
++    logging.info(f"实时推送：{'开启' if ENABLE_LIVE_PUSH else '关闭'}")
 def get_next_trade_day_text(base_dt):
     try:
         trade_cal = ak.tool_trade_date_hist_sina()
@@ -533,6 +570,8 @@ else:
         in_afternoon = True
         logging.info("测试模式：非交易时段，强制启用尾盘防御模式")
 
+log_run_mode()
+
 suggested_position_ratio = 0.6
 market_state = get_recent_market_state()
 dynamic_price_min, dynamic_price_max = get_dynamic_price_bounds(market_state)
@@ -753,36 +792,62 @@ candidates = filtered.sort_values("realtime_score", ascending=False).head(TOP_N_
 history_rows, valid_idx = [], []
 for idx, row in candidates.iterrows():
     code = str(row["code"])
-    if FUNDAMENTAL_CHECK and not has_safe_fundamentals(code): continue
-    time.sleep(0.3)
-    hist_res = evaluate_stock_history(code)
+    logging.info(f"历史评估：{code} {row['name']}")
+    if FUNDAMENTAL_CHECK and not timed_call(has_safe_fundamentals, 8, True, code):
+        logging.info(f"- 基本面未通过 {code}")
+        continue
+    hist_res = timed_call(evaluate_stock_history, 15, default_history_result(), code)
     history_rows.append(hist_res)
     valid_idx.append(idx)
 
-if not valid_idx: logging.info("基本面/历史样本不足，退出"); sys.exit(0)
+if not valid_idx:
+    logging.info("基本面/历史样本不足，退出")
+    log_filter_diag(diag)
+    sys.exit(0)
 
 candidates = candidates.loc[valid_idx].reset_index(drop=True)
 candidates = pd.concat([candidates, pd.DataFrame(history_rows)], axis=1)
+log_stage_summary("历史评估完成", candidates)
 candidates = candidates[candidates["signals"] >= BACKTEST_MIN_SIGNALS].copy()
+log_stage_summary("历史样本满足信号数后", candidates)
 if candidates.empty: logging.info("历史样本不足，退出"); sys.exit(0)
 
 candidates["norm_real"] = quantile_norm(candidates["realtime_score"])
 candidates["norm_hist"] = quantile_norm(candidates["history_score"])
 candidates["final_score"] = candidates["norm_real"] * 0.28 + candidates["norm_hist"] * 0.72 * 100
 candidates = candidates[candidates["final_score"] >= MIN_SCORE_THRESHOLD]
-candidates = candidates.sort_values("final_score", ascending=False).reset_index(drop=True)
+log_stage_summary("评分门槛后", candidates)
 if candidates.empty: logging.info("评分不足，退出"); sys.exit(0)
 
+candidates = candidates.sort_values("final_score", ascending=False).reset_index(drop=True)
 final_candidates = candidates.head(FINAL_HOLDINGS).copy()
-logging.info(f"最终入选 {len(final_candidates)} 只")
+log_stage_summary("最终入选", final_candidates)
 
 market_state = get_recent_market_state()
 market_bias = market_state.get("market_bias", "unknown")
 market_trend = safe_float(market_state.get("market_trend"), 0.0)
 market_volatility = safe_float(market_state.get("market_volatility"), 0.0)
 
+suggested_position_ratio = 0.6 if market_bias == "bull" else 0.3 if market_bias == "bear" else 0.45
 defensive_mode = market_bias == "bear" or market_trend < -1.0
 capital_per_trade = FIX_AMOUNT if not defensive_mode else max(int(FIX_AMOUNT * 0.5), 1000)
+
+quality_preview = summarize_recommendation_quality(candidates)
+logging.info(f"候选质量预览：{quality_preview}")
+
+trade_quality_score = 0
+if quality_preview["count"] >= 1:
+    trade_quality_score += 1
+if quality_preview["avg_win_rate"] >= 50:
+    trade_quality_score += 1
+if quality_preview["avg_net_min"] >= MIN_EXPECTED_NET_PROFIT:
+    trade_quality_score += 1
+if market_bias == "bull":
+    trade_quality_score += 1
+if not defensive_mode:
+    trade_quality_score += 1
+trade_decision = "建议交易" if trade_quality_score >= 3 and len(candidates) > 0 else "建议观望"
+logging.info(f"今日交易判断：{trade_decision}（评分 {trade_quality_score}/5）")
 
 trade_plans = []
 for _, stock in final_candidates.iterrows():
@@ -822,6 +887,8 @@ for _, stock in final_candidates.iterrows():
     })
 
 push_lines = [f"## {today} 低吸风控 · 组合推荐", ""]
+push_lines.append(f"- **今日交易判断**：{trade_decision}")
+push_lines.append(f"- **交易质量评分**：{trade_quality_score}/5")
 push_lines.append(f"- **大盘涨跌**：{market_pct:+.2f}%")
 push_lines.append(f"- **市场趋势（5日）**：{market_trend:+.2f}%")
 push_lines.append(f"- **市场波动率**：{market_volatility:.2%}" if market_volatility else "- **市场波动率**：N/A")
@@ -854,6 +921,11 @@ for plan in trade_plans:
     if plan["net_min"] < MIN_EXPECTED_NET_PROFIT:
         continue
     print(f"推荐 {plan['name']}({plan['code']}) 买入参考 {plan['buy_ref']}，建议股数 {plan['position_size']}，预估净利 {plan['net_min']}~{plan['net_max']} 元")
+
+if RUN_MODE in {"diagnostic", "paper"}:
+    quality = summarize_recommendation_quality(candidates)
+    logging.info(f"质量统计：数量={quality['count']}，平均评分={quality['avg_final_score']:.2f}，平均胜率={quality['avg_win_rate']:.1f}% ，平均预估净利={quality['avg_net_min']:.2f} 元")
+    logging.info(f"今日结论：{trade_decision}")
 
 log_file = "trade_log.csv"
 file_exists = os.path.isfile(log_file)
