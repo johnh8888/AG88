@@ -1,19 +1,19 @@
-name: A股短线选股系统
+name: A股短线选股系统 (efinance版)
 
 on:
   schedule:
-    - cron: '30 1 * * 1-5'     # 周一到周五 北京时间早上9:30左右（UTC+8）
-  workflow_dispatch:           # 支持手动触发
+    - cron: '40 1 * * 1-5'      # 周一至周五 北京时间 9:40 执行（UTC+8）
+  workflow_dispatch:            # 支持手动触发
 
 jobs:
-  run-selector:
+  stock-selection:
     runs-on: ubuntu-latest
 
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
 
-      - name: 设置 Python 3.10
+      - name: 设置 Python 环境
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
@@ -21,19 +21,29 @@ jobs:
 
       - name: 安装依赖
         run: |
-          pip install --upgrade pip
-          pip install efinance pandas numpy requests openpyxl
+          python -m pip install --upgrade pip
+          pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
+            efinance pandas numpy openpyxl
 
       - name: 运行选股脚本
         env:
-          # 如果后续需要其他密钥，可在这里添加
           PYTHONIOENCODING: utf-8
-        run: python stock_recommender_conservative_v2.py
+        run: python stock_recommender_v2.4.py
 
-      - name: 上传选股结果
+      - name: 上传选股结果（供下载）
         uses: actions/upload-artifact@v4
         with:
           name: selected-stocks
           path: |
             selected_stocks.csv
             last_spot_snapshot.csv
+          retention-days: 7
+
+      - name: 打印最终选股结果
+        run: |
+          if [ -f selected_stocks.csv ]; then
+            echo "=== 最终选出股票 ==="
+            cat selected_stocks.csv
+          else
+            echo "未生成选股结果"
+          fi
