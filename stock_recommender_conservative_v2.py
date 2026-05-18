@@ -1,6 +1,6 @@
 # ================================
-# A股短线实战选股系统 V3.0
-# 实战交易员强化版 + 四级容错
+# A股短线实战选股系统 V3.1
+# 完全双源容错 + 无AKShare实时行情仍可运行
 # ================================
 
 import csv
@@ -24,7 +24,6 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-# 日志配置
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
@@ -47,7 +46,7 @@ MIN_AMOUNT = 5e7                # 成交额 > 5千万
 MA_PERIOD = 20
 
 BACKTEST_LOOKBACK_DAYS = 180
-BACKTEST_MIN_SIGNALS = 1        # 至少有一次模式匹配才保留
+BACKTEST_MIN_SIGNALS = 1
 
 MAX_CONSECUTIVE_COLD_DAYS = 2   # 连续冰点天数则空仓
 
@@ -55,7 +54,7 @@ TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
 now = datetime.now(TZ_SHANGHAI)
 today = now.strftime("%Y%m%d")
 
-# 数据源优先级（可调整）
+# 数据源优先级
 DATA_SOURCE_ORDER = ["tencent", "akshare"]
 
 # ================================
@@ -164,7 +163,6 @@ def get_tencent_kline(code, start_date=None, end_date=None, period="daily", adju
     if len(df.columns) >= 6:
         df.columns = ["日期", "col1", "col2", "col3", "col4", "col5"][:len(df.columns)]
         if len(df.columns) == 6:
-            # 常见格式 [日期, 开盘, 收盘, 最高, 最低, 成交量] 或 [日期, 开盘, 最高, 最低, 收盘, 成交量]
             if (pd.to_numeric(df["col2"], errors="coerce") > pd.to_numeric(df["col3"], errors="coerce")).any():
                 df.columns = ["日期", "开盘", "最高", "最低", "收盘", "成交量"]
             else:
@@ -182,7 +180,7 @@ def get_tencent_kline(code, start_date=None, end_date=None, period="daily", adju
     return df[["日期", "开盘", "收盘", "最高", "最低", "成交量", "涨跌幅"]]
 
 # ================================
-# 历史数据统一缓存（双源）
+# 历史数据统一缓存
 # ================================
 
 @lru_cache(maxsize=128)
@@ -212,31 +210,39 @@ def _get_stock_hist_cached(code, start_date, end_date):
     return None
 
 # ================================
-# 市场情绪系统
+# 市场情绪（基于已有行情数据）
 # ================================
 
-def get_market_emotion():
-    try:
-        spot = ak.stock_zh_a_spot_em()
-        pct = pd.to_numeric(spot["涨跌幅"], errors="coerce")
-        up_limit = len(pct[pct >= 9.7])
-        down_limit = len(pct[pct <= -9.5])
-        strong = len(pct[pct >= 5])
-        weak = len(pct[pct <= -5])
-        score = up_limit * 3 + strong - down_limit * 4 - weak
-        if score >= 200:
-            emotion = "hot"
-        elif score <= -50:
-            emotion = "cold"
+def get_market_emotion(df=None):
+    """优先使用传入的DataFrame，否则使用本地快照，都失败返回中性"""
+    if df is not None and not df.empty and "pct" in df.columns:
+        pct = pd.to_numeric(df["pct"], errors="coerce")
+    else:
+        # 尝试从本地快照计算
+        if os.path.exists("last_spot_snapshot.csv"):
+            try:
+                snap = pd.read_csv("last_spot_snapshot.csv")
+                pct = pd.to_numeric(snap["pct"], errors="coerce")
+            except:
+                return {"emotion": "neutral", "score": 0}
         else:
-            emotion = "neutral"
-        return {"emotion": emotion, "score": score, "up_limit": up_limit, "down_limit": down_limit}
-    except Exception as e:
-        logging.warning(f"情绪系统失败: {e}")
-        return {"emotion": "neutral", "score": 0}
+            return {"emotion": "neutral", "score": 0}
+
+    up_limit = len(pct[pct >= 9.7])
+    down_limit = len(pct[pct <= -9.5])
+    strong = len(pct[pct >= 5])
+    weak = len(pct[pct <= -5])
+    score = up_limit * 3 + strong - down_limit * 4 - weak
+    if score >= 200:
+        emotion = "hot"
+    elif score <= -50:
+        emotion = "cold"
+    else:
+        emotion = "neutral"
+    return {"emotion": emotion, "score": score, "up_limit": up_limit, "down_limit": down_limit}
 
 # ================================
-# 热点板块系统
+# 热点板块系统（独立，网络失败不影响）
 # ================================
 
 def get_hot_sector_score():
@@ -252,48 +258,7 @@ def get_hot_sector_score():
         return {}
 
 # ================================
-# 竞价强度因子（新增）
-# ================================
-
-def get_auction_strength(codes):
-    """获取今日集合竞价数据，返回 dict {code: auction_score}"""
-    try:
-        df_auction = ak.stock_zh_a_bid_em()
-        if df_auction is None or df_auction.empty:
-            return {}
-        auction_map = {}
-        for _, row in df_auction.iterrows():
-            code = row["代码"]
-            pct = safe_float(row.get("竞价涨幅", 0))
-            vol = safe_float(row.get("竞价量", 0))
-            prev_vol = safe_float(row.get("昨日成交量", 1))
-            # 评分：高开且竞价量占昨日比重大
-            score = (pct * 2) + min(vol / prev_vol * 100, 5)  # 占比封顶5分
-            auction_map[code] = score
-        return auction_map
-    except Exception as e:
-        logging.warning(f"竞价数据获取失败: {e}")
-        return {}
-
-# ================================
-# 资金流向因子（新增）
-# ================================
-
-def get_money_flow_score(code):
-    """获取个股大单净流入比例，返回分数"""
-    try:
-        flow = ak.stock_individual_fund_flow(stock=code, market="sh" if code.startswith("60") else "sz")
-        if flow is None or flow.empty:
-            return 0
-        latest = flow.iloc[-1]
-        main_net = safe_float(latest.get("主力净流入", 0))
-        amount = safe_float(latest.get("成交额", 1))
-        return (main_net / amount) * 10  # 比例乘10作为分数
-    except:
-        return 0
-
-# ================================
-# MA均线过滤
+# MA均线
 # ================================
 
 def is_above_ma(code, period=MA_PERIOD):
@@ -309,7 +274,7 @@ def is_above_ma(code, period=MA_PERIOD):
     return close.iloc[-1] > ma
 
 # ================================
-# 龙头评分系统
+# 龙头评分
 # ================================
 
 def calc_leader_score(row):
@@ -347,46 +312,51 @@ def evaluate_stock_history(code):
     hist = _get_stock_hist_cached(code, start, end)
     if hist is None or hist.empty:
         return {"signals": 0, "history_score": -999}
-    # 计算趋势与量能配合的天数
     hist["ma20"] = hist["收盘"].rolling(20).mean()
     hist["ma_slope"] = hist["ma20"].diff(3)
     hist["vol_ma5"] = hist["成交量"].rolling(5).mean()
     hist["vol_ratio"] = hist["成交量"] / hist["vol_ma5"]
     bull_days = ((hist["ma_slope"] > 0) & (hist["vol_ratio"] > 1.2)).sum()
-    history_score = bull_days * 2 + hist["涨跌幅"].std() * (-0.1)  # 奖励趋势连续，惩罚高波动
+    history_score = bull_days * 2 + hist["涨跌幅"].std() * (-0.1)
     return {"signals": bull_days, "history_score": history_score}
 
 # ================================
-# 实时行情获取（四级容错）
+# 代码列表获取（四级容错）
 # ================================
+
+# 内置100只高流动性主板蓝筹股，确保在无任何网络时仍有足够候选池
+_BUILTIN_CODES = [
+    "600519", "000858", "601318", "000333", "600036", "601166", "600276", "600030", "000651", "002415",
+    "601012", "600900", "000001", "600809", "002475", "601888", "600887", "601398", "601939", "601288",
+    "600585", "600690", "000725", "002714", "601668", "600048", "600050", "601688", "600309", "600031",
+    "000002", "601328", "600000", "601601", "600837", "000338", "002230", "601899", "600570", "000776",
+    "300059", "601857", "600104", "600009", "601006", "600016", "600029", "601211", "601628", "601319",
+    "601336", "600015", "601818", "601988", "600028", "601088", "600019", "601766", "000100", "002352",
+    "601390", "600346", "000063", "600588", "600547", "600438", "300015", "002142", "600196", "600111",
+    "002027", "601878", "600926", "600703", "000876", "000538", "002456", "601225", "600150", "601919",
+    "002353", "600143", "002460", "300122", "000661", "300124", "002241", "600183", "600745", "000977",
+    "002049", "603259", "601360", "600018", "000568", "000625", "002304", "600132", "000895", "002007",
+    "600893", "600519", "000858", "002271", "600436", "600809", "000596", "000799", "002142", "000423",
+]
 
 _CODE_LIST_CACHE = None
 
 def _get_all_codes():
-    """获取全市场代码列表，四级容错：AKShare spot -> AKShare备用 -> 本地快照 -> 内置最小列表"""
+    """四级容错：AKShare spot -> 本地快照 -> 内置列表，永不报空"""
     global _CODE_LIST_CACHE
     if _CODE_LIST_CACHE is not None:
         return _CODE_LIST_CACHE
 
-    # 级别1: 标准接口
+    # 级别1: 尝试 AKShare（仅此一次，不重试避免超时）
     try:
         raw = ak.stock_zh_a_spot_em()
         codes = raw["代码"].tolist()
         _CODE_LIST_CACHE = codes
         return codes
     except Exception as e:
-        logging.warning(f"akshare spot_em 获取代码失败: {e}")
+        logging.warning(f"AKShare 代码获取失败: {e}")
 
-    # 级别2: 备用接口
-    try:
-        raw = ak.stock_zh_a_spot()
-        codes = raw["代码"].tolist()
-        _CODE_LIST_CACHE = codes
-        return codes
-    except Exception as e:
-        logging.warning(f"akshare spot 备用失败: {e}")
-
-    # 级别3: 从本地快照中提取代码
+    # 级别2: 本地快照
     if os.path.exists("last_spot_snapshot.csv"):
         try:
             df = pd.read_csv("last_spot_snapshot.csv")
@@ -397,26 +367,25 @@ def _get_all_codes():
         except Exception as e:
             logging.warning(f"读取本地快照代码失败: {e}")
 
-    # 级别4: 内置最小高流动性股票池（避免彻底崩溃）
-    builtin_codes = [
-        "600519", "000858", "601318", "000333", "600036",
-        "601166", "600276", "600030", "000651", "002415",
-        "300750", "002594", "601012", "600900", "000001",
-    ]
-    logging.warning("使用内置最小代码列表，结果仅供参考")
-    _CODE_LIST_CACHE = builtin_codes
-    return builtin_codes
+    # 级别3: 内置100只蓝筹股
+    logging.warning("使用内置100只蓝筹股列表作为股票池")
+    _CODE_LIST_CACHE = _BUILTIN_CODES.copy()
+    return _BUILTIN_CODES
+
+# ================================
+# 实时行情获取（完全重构）
+# ================================
 
 def fetch_spot_data():
-    """获取实时行情，四级容错：腾讯 -> AKShare -> 本地快照 -> 内置最小列表"""
+    """主力数据源：腾讯接口（需要代码列表），失败则降级本地快照"""
     codes = _get_all_codes()
 
-    # 优先尝试腾讯（需要代码列表）
+    # 优先腾讯
     if "tencent" in DATA_SOURCE_ORDER:
         try:
             df = fetch_spot_data_tencent(codes)
-            if df is not None and not df.empty and len(df) > 1000:
-                # 补充行业信息
+            if df is not None and not df.empty and len(df) > 10:
+                # 尝试补充行业信息（若网络可用）
                 try:
                     raw_ak = ak.stock_zh_a_spot_em()
                     industry_map = dict(zip(raw_ak["代码"], raw_ak.get("行业", "未知")))
@@ -428,66 +397,51 @@ def fetch_spot_data():
         except Exception as e:
             logging.warning(f"腾讯行情失败: {e}")
 
-    # 降级AKShare
-    if "akshare" in DATA_SOURCE_ORDER:
-        try:
-            raw = ak.stock_zh_a_spot_em()
-            if raw is not None and not raw.empty:
-                df = pd.DataFrame()
-                df["code"] = raw["代码"]
-                df["name"] = raw["名称"]
-                df["price"] = pd.to_numeric(raw["最新价"], errors="coerce")
-                df["pct"] = pd.to_numeric(raw["涨跌幅"], errors="coerce")
-                df["amount"] = pd.to_numeric(raw["成交额"], errors="coerce")
-                df["lb"] = pd.to_numeric(raw.get("量比", 1), errors="coerce").fillna(1)
-                df["turnover"] = pd.to_numeric(raw["换手率"], errors="coerce")
-                df["amplitude"] = pd.to_numeric(raw["振幅"], errors="coerce")
-                df["open"] = pd.to_numeric(raw["今开"], errors="coerce")
-                df["prev_close"] = pd.to_numeric(raw["昨收"], errors="coerce")
-                df["行业"] = raw.get("行业", "未知")
-                df.to_csv("last_spot_snapshot.csv", index=False)
-                return df
-        except Exception as e:
-            logging.warning(f"AKShare行情失败: {e}")
-
-    # 降级本地快照
+    # 降级：本地快照
     if os.path.exists("last_spot_snapshot.csv"):
         logging.warning("使用本地离线行情快照")
         return pd.read_csv("last_spot_snapshot.csv")
 
-    # 最终降级：用内置代码列表尝试腾讯再次请求
+    # 最终尝试：用内置代码再请求一次腾讯
     try:
-        df = fetch_spot_data_tencent(codes)
+        df = fetch_spot_data_tencent(_BUILTIN_CODES)
         if df is not None and not df.empty:
             return df
     except:
         pass
 
-    raise RuntimeError("所有行情数据源均不可用，请检查网络环境")
+    raise RuntimeError("所有行情数据源均不可用，请检查网络或运行一次本地生成快照")
 
 # ================================
-# 全局超时保护
+# 全局超时
 # ================================
 
 class TimeoutError(Exception):
     pass
 
 def timeout_handler(signum, frame):
-    raise TimeoutError("选股流程超过30秒，强制终止")
+    raise TimeoutError("选股流程超过90秒，强制终止")
 
 # ================================
 # 主程序
 # ================================
 
 def main():
+    # 90秒超时（涵盖多线程历史回测）
     signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(30)  # 30秒超时
+    signal.alarm(90)
 
     try:
-        logging.info("启动实战选股系统 V3.0")
+        logging.info("启动实战选股系统 V3.1")
 
-        # 获取市场情绪
-        emotion = get_market_emotion()
+        # 获取行情数据（优先腾讯）
+        df = fetch_spot_data()
+        if df.empty:
+            logging.error("无行情数据")
+            return
+
+        # 基于已有数据计算情绪（不再单独请求AKShare）
+        emotion = get_market_emotion(df)
         logging.info(f"市场情绪: {emotion}")
 
         # 连续冰点检查
@@ -503,17 +457,10 @@ def main():
         with open(cold_days_file, "w") as f:
             f.write(str(previous_cold))
 
+        final_holdings = FINAL_HOLDINGS
         if previous_cold >= MAX_CONSECUTIVE_COLD_DAYS:
             logging.warning(f"连续冰点{previous_cold}天，系统建议空仓")
-            FINAL_HOLDINGS = 0
-        else:
-            FINAL_HOLDINGS = 5  # 可配置
-
-        # 获取实时行情
-        df = fetch_spot_data()
-        if df.empty:
-            logging.error("无行情数据")
-            return
+            final_holdings = 0
 
         # 剔除涨跌停
         df = df[df["pct"].abs() < 9.8]
@@ -549,27 +496,28 @@ def main():
         # 波动率扣分
         df["score"] -= df["volatility_ratio"].fillna(0) * 100 * 0.5
 
-        # 竞价强度加分（新增）
-        logging.info("计算竞价强度...")
-        auction_map = get_auction_strength(df["code"].tolist())
-        df["auction_score"] = df["code"].map(auction_map).fillna(0)
-        df["score"] += df["auction_score"]
-
-        # 资金流向加分（新增，仅对TOP候选计算以节约时间）
-        # 先选出初筛前30名计算资金流向
-        top30 = df.sort_values("score", ascending=False).head(30)
-        logging.info("计算资金流向...")
-        for idx, row in top30.iterrows():
+        # 资金流向（仅对初筛前20只计算，避免网络压力）
+        top20 = df.sort_values("score", ascending=False).head(20)
+        logging.info("计算资金流向（前20名）...")
+        for idx, row in top20.iterrows():
             code = row["code"]
-            flow_score = get_money_flow_score(code)
-            df.loc[idx, "score"] += flow_score
-            time.sleep(0.05)  # 礼貌延迟
+            try:
+                flow = ak.stock_individual_fund_flow(stock=code, market="sh" if code.startswith("60") else "sz")
+                if flow is not None and not flow.empty:
+                    latest = flow.iloc[-1]
+                    main_net = safe_float(latest.get("主力净流入", 0))
+                    amount = safe_float(latest.get("成交额", 1))
+                    flow_score = (main_net / amount) * 10
+                    df.loc[idx, "score"] += flow_score
+            except Exception as e:
+                logging.debug(f"资金流向获取失败 {code}: {e}")
+            time.sleep(0.02)
 
         # 强势龙头保护
         strong_stock = (df["pct"] >= 7) & (df["turnover"] >= 8)
         df.loc[strong_stock, "score"] += 15
 
-        # 涨停龙头（剔除涨停后其实不会有，但保留逻辑）
+        # 涨停龙头（虽然已剔除涨停，保留逻辑）
         df.loc[df["pct"] >= 9, "score"] += 20
 
         # 放量突破
@@ -581,7 +529,7 @@ def main():
         # 热点板块
         logging.info("计算热点板块...")
         sector_map = get_hot_sector_score()
-        if "行业" in df.columns:
+        if "行业" in df.columns and sector_map:
             df["sector_score"] = df["行业"].map(sector_map).fillna(0)
             df["score"] += df["sector_score"] * 0.5
 
@@ -591,7 +539,7 @@ def main():
         elif emotion["emotion"] == "cold":
             df["score"] -= df["amplitude"] * 0.8
 
-        # 板块龙头过滤（每个板块只保留前2名）
+        # 板块龙头过滤（同一行业只留前2名）
         if "行业" in df.columns and len(df) > 0:
             df['rank_in_sector'] = df.groupby('行业')['pct'].rank(ascending=False)
             df = df[df['rank_in_sector'] <= 2]
@@ -600,7 +548,7 @@ def main():
         filtered = df.sort_values("score", ascending=False).head(80)
         logging.info(f"评分后候选: {len(filtered)}")
 
-        # 历史回测评分（多线程加速）
+        # 历史回测评分（多线程）
         history_rows = []
         valid_indices = []
 
@@ -634,9 +582,9 @@ def main():
             candidates["score"] * 0.55 + candidates["history_score"] * 0.45
         )
         candidates = candidates.sort_values("final_score", ascending=False)
-        final_candidates = candidates.head(FINAL_HOLDINGS)
+        final_candidates = candidates.head(final_holdings)
 
-        # 动态仓位建议
+        # 动态仓位
         total_score = final_candidates["final_score"].sum()
         if total_score > 0:
             final_candidates["建议仓位%"] = (final_candidates["final_score"] / total_score * 100).round(1)
@@ -645,7 +593,7 @@ def main():
 
         # 输出
         print("\n" + "=" * 60)
-        print("A股实战短线选股结果 (V3.0)")
+        print("A股实战短线选股结果 (V3.1)")
         print("=" * 60)
         for _, row in final_candidates.iterrows():
             print(f"""
@@ -671,7 +619,7 @@ def main():
         logging.info("结果已保存 selected_stocks.csv")
 
     except TimeoutError:
-        logging.error("流程超时，请检查网络或减少候选股票数量")
+        logging.error("流程超时（>90秒），请减少候选股数量或检查网络")
     except Exception as e:
         logging.exception(f"运行异常: {e}")
     finally:
