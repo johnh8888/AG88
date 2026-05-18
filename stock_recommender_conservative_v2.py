@@ -18,6 +18,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 # ==================== 配置 ====================
 PUSHPLUS_TOKEN = os.getenv("PUSHPLUS_TOKEN")
 TEST_MODE = os.getenv("TEST_MODE", "1") == "1"
+RUN_MODE = os.getenv("RUN_MODE", "diagnostic").lower()  # diagnostic / paper / live
 
 TOTAL_CAPITAL = 20000
 TRADE_RATIO = 0.6
@@ -50,7 +51,8 @@ RECENT_LIMIT_DOWN_FILTER = True
 LIMIT_DOWN_LOOKBACK = 5
 
 # ---------- 放宽版筛选参数 ----------
-MIN_PRICE, MAX_PRICE = 8, 30
+PRICE_MIN_CAP = 3.0
+PRICE_MAX_CAP = 120.0
 EARLY_MIN_PCT = 0.3
 MIN_AMOUNT = 1.0e8
 MIN_LB, MAX_LB = 0.8, 3.0
@@ -58,6 +60,9 @@ MIN_TURNOVER, MAX_TURNOVER = 1.0, 9.0
 MIN_AMPLITUDE, MAX_AMPLITUDE = 1.0, 7.0
 MAX_OPEN_PCT = 2.5
 MAX_PCT = 5.5
+VOL_LOOKBACK_DAYS = 20
+MAX_VOLATILITY_RATIO = 0.065
+MAX_GAP_OPEN_RATIO = 0.045
 
 # 尾盘条件放宽
 EOD_MAX_PCT = 2.5
@@ -74,6 +79,11 @@ BACKTEST_LOOKBACK_DAYS = 180
 BACKTEST_MIN_SIGNALS = 2
 MIN_CONSECUTIVE_UP = 3
 FUNDAMENTAL_CHECK = True
+
+MAX_PORTFOLIO_RISK_PER_TRADE = 0.01
+MAX_DAILY_LOSS_RATIO = 0.02
+MIN_EXPECTED_NET_PROFIT = 80
+TRAILING_STOP_RATIO = 0.01
 
 TZ_SHANGHAI = ZoneInfo("Asia/Shanghai")
 now = datetime.now(TZ_SHANGHAI)
@@ -108,6 +118,110 @@ def calc_open_pct(row):
     opn = safe_float(row.get("open", row.get("今开")), 0.0)
     if prev <= 0 or opn <= 0: return np.nan
     return (opn / prev - 1) * 100
+
+
+def calc_volatility_ratio(code, lookback_days=VOL_LOOKBACK_DAYS):
+    try:
+        end = now.strftime("%Y%m%d")
+        start = (now - timedelta(days=lookback_days + 40)).strftime("%Y%m%d")
+        hist = ak.stock_zh_a_hist(symbol=code, period="daily", start_date=start, end_date=end, adjust="qfq")
+        if hist is None or hist.empty or len(hist) < lookback_days:
+            return np.nan
+        close = hist.sort_values("日期")["收盘"].astype(float).tail(lookback_days)
+        if close.mean() <= 0:
+            return np.nan
+        return float(close.std(ddof=0) / close.mean())
+    except Exception as e:
+        logging.debug(f"波动率计算失败 {code}: {e}")
+        return np.nan
+
+
+def get_recent_market_state():
+    try:
+        index_df = ak.stock_zh_index_daily(symbol="sh000001")
+        if index_df is None or index_df.empty:
+            return {"market_trend": 0.0, "market_volatility": np.nan, "market_bias": "unknown"}
+        index_df = index_df.sort_values("date").tail(30).copy()
+        close = index_df["close"].astype(float)
+        trend_5 = (close.iloc[-1] / close.iloc[-6] - 1) * 100 if len(close) >= 6 else 0.0
+        volatility = float(close.tail(20).std(ddof=0) / close.tail(20).mean()) if len(close) >= 20 and close.tail(20).mean() > 0 else np.nan
+        if trend_5 >= 1.0:
+            bias = "bull"
+        elif trend_5 <= -1.0:
+            bias = "bear"
+        else:
+            bias = "neutral"
+        return {"market_trend": trend_5, "market_volatility": volatility, "market_bias": bias}
+    except Exception as e:
+        logging.warning(f"市场状态获取失败: {e}")
+        return {"market_trend": 0.0, "market_volatility": np.nan, "market_bias": "unknown"}
+
+
+def get_dynamic_price_bounds(market_state):
+    if market_state.get("market_bias") == "bull":
+        return 5.0, 160.0
+    if market_state.get("market_bias") == "bear":
+        return 8.0, 35.0
+    return PRICE_MIN_CAP, PRICE_MAX_CAP
+
+
+def get_dynamic_volatility_cap(market_state):
+    vol = market_state.get("market_volatility")
+    if pd.isna(vol):
+        return MAX_VOLATILITY_RATIO
+    if market_state.get("market_bias") == "bull":
+        return min(MAX_VOLATILITY_RATIO * 1.15, 0.085)
+    if market_state.get("market_bias") == "bear":
+        return MAX_VOLATILITY_RATIO * 0.8
+    return MAX_VOLATILITY_RATIO
+
+
+def get_dynamic_gap_cap(market_state):
+    if market_state.get("market_bias") == "bull":
+        return 0.06
+    if market_state.get("market_bias") == "bear":
+        return 0.03
+    return MAX_GAP_OPEN_RATIO
+
+
+def calculate_position_size(capital, stop_price, entry_price):
+    if capital <= 0 or entry_price <= 0 or stop_price <= 0 or stop_price >= entry_price:
+        return 0
+    risk_per_share = entry_price - stop_price
+    max_risk_cash = capital * MAX_PORTFOLIO_RISK_PER_TRADE
+    shares = int(max_risk_cash // risk_per_share)
+    return max((shares // 100) * 100, 0)
+
+
+def get_dynamic_exit_prices(entry_price, capital):
+    hard_stop = round(entry_price * 0.98, 2)
+    trailing_stop = round(entry_price * (1 - TRAILING_STOP_RATIO), 2)
+    stop_price = min(hard_stop, trailing_stop)
+    target_min = round(entry_price * 1.03, 2)
+    target_max = round(entry_price * 1.05, 2)
+    size = calculate_position_size(capital, stop_price, entry_price)
+    return {
+        "stop_price": stop_price,
+        "target_min": target_min,
+        "target_max": target_max,
+        "position_size": size,
+    }
+
+
+def record_filter_diag(diag, stage, before, after, note=""):
+    diag.append({"stage": stage, "before": before, "after": after, "drop": before - after, "note": note})
+
+
+def log_filter_diag(diag):
+    if not diag:
+        return
+    logging.info("===== 逐层筛选诊断 =====")
+    for item in diag:
+        msg = f"{item['stage']}: {item['before']} -> {item['after']} (减少 {item['drop']})"
+        if item.get("note"):
+            msg += f" | {item['note']}"
+        logging.info(msg)
+    logging.info("========================")
 
 def get_next_trade_day_text(base_dt):
     try:
@@ -272,7 +386,7 @@ def evaluate_stock_history(symbol):
                 safe_float(row["amount"]) >= MIN_AMOUNT and
                 MIN_TURNOVER <= safe_float(row.get("turnover"), 0) <= MAX_TURNOVER and
                 MIN_AMPLITUDE <= safe_float(row.get("amplitude"), 0) <= MAX_AMPLITUDE and
-                MIN_PRICE <= safe_float(row["close"]) <= MAX_PRICE and
+                PRICE_MIN_CAP <= safe_float(row["close"]) <= PRICE_MAX_CAP and
                 safe_float(row.get("open_pct"), 999) <= MAX_OPEN_PCT):
             continue
         buy_price = safe_float(nxt["open"])
@@ -420,6 +534,21 @@ else:
         logging.info("测试模式：非交易时段，强制启用尾盘防御模式")
 
 suggested_position_ratio = 0.6
+market_state = get_recent_market_state()
+dynamic_price_min, dynamic_price_max = get_dynamic_price_bounds(market_state)
+dynamic_vol_cap = get_dynamic_volatility_cap(market_state)
+dynamic_gap_cap = get_dynamic_gap_cap(market_state)
+logging.info(
+    f"市场状态：趋势{market_state.get('market_trend', 0.0):+.2f}% / "
+    f"波动{safe_float(market_state.get('market_volatility'), 0.0) * 100:.2f}% / "
+    f"{market_state.get('market_bias', 'unknown')}"
+)
+if RUN_MODE == "diagnostic":
+    logging.info("运行模式：诊断模式，仅输出筛选结果与诊断信息")
+elif RUN_MODE == "paper":
+    logging.info("运行模式：模拟盘模式，输出推荐但不做外部推送依赖")
+else:
+    logging.info("运行模式：实盘模式")
 if MA20_FILTER:
     _, _, ma_safe = get_market_ma20_safe()
     if not ma_safe and not TEST_MODE:
@@ -461,13 +590,39 @@ if market_is_weak(market_pct):
     logging.info(f"市场跌幅 {market_pct:.2f}% 过深，空仓")
     sys.exit(0)
 
+if dynamic_price_min > 0 and dynamic_price_max > 0:
+    logging.info(f"动态价格区间：{dynamic_price_min:.2f} ~ {dynamic_price_max:.2f}")
+
+
 df = raw_df.copy()
 df["open_pct"] = df.apply(calc_open_pct, axis=1)
 for col in ["turnover","amplitude","open_pct"]: df[col] = get_col(df, col, np.nan)
+df["volatility_ratio"] = df["code"].apply(calc_volatility_ratio)
+df["gap_open_ratio"] = df["open_pct"].fillna(999).abs() / 100.0
+
+diag = []
+record_filter_diag(diag, "原始行情", len(df), len(df), "实时行情数据")
 
 ban_pattern = r"(^ST|^\*ST|退市|^N|^C[^N]|XD|XR)"
+before = len(df)
 df = df[~df["name"].str.contains(ban_pattern, na=False, regex=True)]
+record_filter_diag(diag, "剔除ST/退市/异常名称", before, len(df))
+
+before = len(df)
 df = df[(df["code"].astype(str).str.startswith(("60","00")))]
+record_filter_diag(diag, "仅保留沪深主板", before, len(df))
+
+before = len(df)
+df = df[(df["price"] >= dynamic_price_min) & (df["price"] <= dynamic_price_max)]
+record_filter_diag(diag, "动态价格过滤", before, len(df), f"{dynamic_price_min:.2f}~{dynamic_price_max:.2f}")
+
+before = len(df)
+df = df[(df["volatility_ratio"].isna()) | (df["volatility_ratio"] <= dynamic_vol_cap)]
+record_filter_diag(diag, "近20日波动率过滤", before, len(df), f"上限 {dynamic_vol_cap:.2%}")
+
+before = len(df)
+df = df[(df["gap_open_ratio"].isna()) | (df["gap_open_ratio"] <= dynamic_gap_cap)]
+record_filter_diag(diag, "开盘跳空过滤", before, len(df), f"上限 {dynamic_gap_cap:.2%}")
 
 if SECTOR_FILTER_ENABLED:
     try:
@@ -485,44 +640,48 @@ if SECTOR_FILTER_ENABLED:
 
 # 早盘筛选
 if in_morning:
+    before = len(df)
     filtered = df[
-        (df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE) &
+        (df["price"] >= dynamic_price_min) & (df["price"] <= dynamic_price_max) &
         (df["pct"] >= EARLY_MIN_PCT) & (df["pct"] <= MAX_PCT) &
         (df["amount"] >= MIN_AMOUNT) &
         (df["lb"] >= MIN_LB_DYNAMIC) & (df["lb"] <= MAX_LB_DYNAMIC) &
         (df["turnover"] >= MIN_TURNOVER) & (df["turnover"] <= MAX_TURNOVER) &
         (df["amplitude"] >= MIN_AMPLITUDE) & (df["amplitude"] <= MAX_AMPLITUDE) &
-        (df["open_pct"] <= MAX_OPEN_PCT)
+        (df["open_pct"] <= MAX_OPEN_PCT) &
+        (df["volatility_ratio"].isna() | (df["volatility_ratio"] <= dynamic_vol_cap))
     ].copy()
     if CONSECUTIVE_UP_ENABLED:
         filtered = filtered[filtered["code"].apply(has_consecutive_mild_up)]
-    logging.info(f"早盘初步筛选 {len(filtered)} 只")
+    record_filter_diag(diag, "早盘初筛", before, len(filtered), "强势/温和放量/非高开")
 else:
     filtered = pd.DataFrame()
 
 # 尾盘 + 增强 fallback
 if (filtered.empty and not in_morning) or in_afternoon:
     logging.info("切换到尾盘防御模式...")
+    before = len(df)
     filtered = df[
-        (df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE) &
+        (df["price"] >= dynamic_price_min) & (df["price"] <= dynamic_price_max) &
         (df["pct"] >= EOD_MIN_PCT) & (df["pct"] <= EOD_MAX_PCT) &
         (df["amount"] >= MIN_AMOUNT) &
         (df["lb"] >= EOD_MIN_LB_DYNAMIC) & (df["lb"] <= EOD_MAX_LB_DYNAMIC) &
         (df["turnover"] <= EOD_MAX_TURNOVER) &
-        (df["amplitude"] <= EOD_MAX_AMPLITUDE)
+        (df["amplitude"] <= EOD_MAX_AMPLITUDE) &
+        (df["volatility_ratio"].isna() | (df["volatility_ratio"] <= dynamic_vol_cap))
     ].copy()
     if CONSECUTIVE_UP_ENABLED:
         filtered = filtered[filtered["code"].apply(has_consecutive_mild_up)]
-    logging.info(f"尾盘筛选 {len(filtered)} 只")
+    record_filter_diag(diag, "尾盘筛选", before, len(filtered), "低波动/低跳空")
 
     if filtered.empty and is_sina_data:
         logging.warning("尾盘空，开始数据诊断及fallback")
-        price_ok = len(df[(df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE)])
+        price_ok = len(df[(df["price"] >= dynamic_price_min) & (df["price"] <= dynamic_price_max)])
         amount_ok = len(df[df["amount"] >= MIN_AMOUNT])
         pct_range = len(df[(df["pct"] >= -3) & (df["pct"] <= 3)])
         diag_msg = (f"## 数据诊断 ({today})\n"
                     f"- 数据源：新浪\n"
-                    f"- 价格8~30元：{price_ok} 只\n"
+                    f"- 动态价格区间：{dynamic_price_min:.2f}~{dynamic_price_max:.2f}\n"
                     f"- 成交额≥1亿：{amount_ok} 只\n"
                     f"- 涨跌幅-3%~3%：{pct_range} 只\n"
                     f"- 价格min/max：{df['price'].min():.2f}/{df['price'].max():.2f}\n"
@@ -530,24 +689,30 @@ if (filtered.empty and not in_morning) or in_afternoon:
                     f"- 涨跌幅min/max：{df['pct'].min():.2f}%/{df['pct'].max():.2f}%")
         push("选股系统数据诊断", diag_msg)
 
-        # fallback 放宽涨跌幅-3~3%，忽略换手率/振幅，保留成交额
         logging.warning("启用新浪fallback：涨跌幅-3%~3%")
+        before = len(df)
         filtered = df[
-            (df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE) &
+            (df["price"] >= dynamic_price_min) & (df["price"] <= dynamic_price_max) &
             (df["pct"] >= -3) & (df["pct"] <= 3) &
             (df["amount"] >= MIN_AMOUNT) &
-            (df["lb"] >= 0.5) & (df["lb"] <= 5.0)
+            (df["lb"] >= 0.5) & (df["lb"] <= 5.0) &
+            (df["volatility_ratio"].isna() | (df["volatility_ratio"] <= dynamic_vol_cap))
         ].copy()
+        record_filter_diag(diag, "新浪fallback", before, len(filtered), "放宽涨跌幅、保留成交额")
         logging.info(f"fallback筛选 {len(filtered)} 只")
 
         if filtered.empty:
             logging.warning("最终兜底：取消成交额限制，仅价格与涨跌幅")
+            before = len(df)
             filtered = df[
-                (df["price"] >= MIN_PRICE) & (df["price"] <= MAX_PRICE) &
+                (df["price"] >= dynamic_price_min) & (df["price"] <= dynamic_price_max) &
                 (df["pct"] >= -10) & (df["pct"] <= 10) &
                 (df["amount"] > 0)
             ].copy()
+            record_filter_diag(diag, "最终兜底", before, len(filtered), "仅保留价格/涨跌幅/成交额>0")
             logging.info(f"最终兜底筛选 {len(filtered)} 只")
+
+log_filter_diag(diag)
 
 if filtered.empty:
     logging.info("初筛无标的，空仓退出")
@@ -558,18 +723,25 @@ if 'code' not in filtered.columns:
     sys.exit(1)
 
 # 增强过滤
+before = len(filtered)
 if INDIVIDUAL_MA_FILTER:
     filtered = filtered[filtered["code"].apply(lambda x: is_above_ma(x, MA_PERIOD))]
-    logging.info(f"均线过滤后 {len(filtered)} 只")
-    if filtered.empty: logging.info("退出"); sys.exit(0)
+    record_filter_diag(diag, "均线过滤", before, len(filtered), f"MA{MA_PERIOD} 上方")
+    if filtered.empty: logging.info("退出"); log_filter_diag(diag); sys.exit(0)
+
+before = len(filtered)
 if MAIN_INFLOW_FILTER:
     filtered = filtered[filtered["code"].apply(has_main_inflow)]
-    logging.info(f"主力资金过滤后 {len(filtered)} 只")
-    if filtered.empty: logging.info("退出"); sys.exit(0)
+    record_filter_diag(diag, "主力资金过滤", before, len(filtered), "主力净流入为正")
+    if filtered.empty: logging.info("退出"); log_filter_diag(diag); sys.exit(0)
+
+before = len(filtered)
 if RECENT_LIMIT_DOWN_FILTER:
     filtered = filtered[~filtered["code"].apply(has_recent_limit_down)]
-    logging.info(f"近跌停过滤后 {len(filtered)} 只")
-    if filtered.empty: logging.info("退出"); sys.exit(0)
+    record_filter_diag(diag, "近跌停过滤", before, len(filtered), f"近{LIMIT_DOWN_LOOKBACK}日无跌停")
+    if filtered.empty: logging.info("退出"); log_filter_diag(diag); sys.exit(0)
+
+log_filter_diag(diag)
 
 # 优化后的实时评分
 filtered["realtime_score"] = (
@@ -602,17 +774,28 @@ candidates = candidates.sort_values("final_score", ascending=False).reset_index(
 if candidates.empty: logging.info("评分不足，退出"); sys.exit(0)
 
 final_candidates = candidates.head(FINAL_HOLDINGS).copy()
+logging.info(f"最终入选 {len(final_candidates)} 只")
+
+market_state = get_recent_market_state()
+market_bias = market_state.get("market_bias", "unknown")
+market_trend = safe_float(market_state.get("market_trend"), 0.0)
+market_volatility = safe_float(market_state.get("market_volatility"), 0.0)
+
+defensive_mode = market_bias == "bear" or market_trend < -1.0
+capital_per_trade = FIX_AMOUNT if not defensive_mode else max(int(FIX_AMOUNT * 0.5), 1000)
 
 trade_plans = []
 for _, stock in final_candidates.iterrows():
     p = safe_float(stock["price"])
     buy_ref = round(p * LOW_BUY_RATIO, 2)
-    stop = round(buy_ref * (1 + HARD_STOP_RATIO), 2)
-    target_min = calc_target_sell_price(buy_ref, FIX_AMOUNT, NET_PROFIT_TARGET_MIN)
-    target_max = calc_target_sell_price(buy_ref, FIX_AMOUNT, NET_PROFIT_TARGET_MAX)
-    net_min = round(calc_net_profit(target_min, buy_ref, FIX_AMOUNT), 2)
-    net_max = round(calc_net_profit(target_max, buy_ref, FIX_AMOUNT), 2)
-    net_stop = round(calc_net_profit(stop, buy_ref, FIX_AMOUNT), 2)
+    exit_plan = get_dynamic_exit_prices(buy_ref, capital_per_trade)
+    stop = exit_plan["stop_price"]
+    target_min = exit_plan["target_min"]
+    target_max = exit_plan["target_max"]
+    position_size = exit_plan["position_size"]
+    net_min = round(calc_net_profit(target_min, buy_ref, capital_per_trade), 2)
+    net_max = round(calc_net_profit(target_max, buy_ref, capital_per_trade), 2)
+    net_stop = round(calc_net_profit(stop, buy_ref, capital_per_trade), 2)
     atr_stop = None
     try:
         hist_atr = ak.stock_zh_a_hist(symbol=stock["code"], period="daily",
@@ -630,32 +813,47 @@ for _, stock in final_candidates.iterrows():
         "buy_ref": buy_ref, "stop_hard": stop, "stop_atr": atr_stop,
         "target_min": target_min, "target_max": target_max,
         "net_min": net_min, "net_max": net_max, "net_stop": net_stop,
+        "position_size": position_size,
         "signals": int(stock["signals"]), "win_rate": safe_float(stock["win_rate"]),
         "hit_250": safe_float(stock["target_250_hit_rate"]),
         "hit_350": safe_float(stock["target_350_hit_rate"]),
-        "final_score": safe_float(stock["final_score"]), "market_pct": market_pct
+        "final_score": safe_float(stock["final_score"]), "market_pct": market_pct,
+        "market_bias": market_bias, "market_trend": market_trend, "market_volatility": market_volatility
     })
 
-push_lines = [f"## {today} 低吸稳赢 · 组合推荐", ""]
+push_lines = [f"## {today} 低吸风控 · 组合推荐", ""]
 push_lines.append(f"- **大盘涨跌**：{market_pct:+.2f}%")
+push_lines.append(f"- **市场趋势（5日）**：{market_trend:+.2f}%")
+push_lines.append(f"- **市场波动率**：{market_volatility:.2%}" if market_volatility else "- **市场波动率**：N/A")
+push_lines.append(f"- **市场偏向**：{market_bias}")
 push_lines.append(f"- **建议总仓位**：{suggested_position_ratio*100:.0f}%")
-push_lines.append("- **止盈策略**：达标止盈 / 移动止盈（回撤1%离场）")
+push_lines.append(f"- **单票风险上限**：{MAX_PORTFOLIO_RISK_PER_TRADE*100:.1f}%")
+push_lines.append(f"- **单票预估净利门槛**：≥{MIN_EXPECTED_NET_PROFIT} 元")
+push_lines.append("- **止盈策略**：分批止盈 / 移动止盈（回撤1%离场）")
+if defensive_mode:
+    push_lines.append("- ⚠️ 当前进入防御模式，仓位自动减半")
 if is_sina_data:
     push_lines.append("- ⚠️ 数据源：新浪（部分字段缺失，条件已放宽）")
 push_lines.append("")
 for plan in trade_plans:
+    if plan["net_min"] < MIN_EXPECTED_NET_PROFIT:
+        continue
     push_lines.append(f"### {plan['name']}({plan['code']})")
     push_lines.append(f"- 现价：{plan['price']:.2f}")
-    push_lines.append(f"- 低吸参考：{plan['buy_ref']}")
+    push_lines.append(f"- 买入参考：{plan['buy_ref']}")
     push_lines.append(f"- 止盈区间：{plan['target_min']} ~ {plan['target_max']}")
     stop_info = f"- 硬止损：{plan['stop_hard']}" + (f" / ATR止损：{plan['stop_atr']}" if plan['stop_atr'] else "")
     push_lines.append(stop_info)
+    push_lines.append(f"- 建议股数：{plan['position_size']} 股")
     push_lines.append(f"- 预估净利：{plan['net_min']} ~ {plan['net_max']} 元")
     push_lines.append(f"- 止损亏损：{plan['net_stop']} 元")
     push_lines.append(f"- 信号：{plan['signals']}次 | 胜率：{plan['win_rate']:.1f}% | "
                      f"250命中：{plan['hit_250']:.1f}% | 350命中：{plan['hit_350']:.1f}%\n")
 push("\n".join(push_lines).strip())
-for plan in trade_plans: print(f"推荐 {plan['name']}({plan['code']}) 买入参考 {plan['buy_ref']}")
+for plan in trade_plans:
+    if plan["net_min"] < MIN_EXPECTED_NET_PROFIT:
+        continue
+    print(f"推荐 {plan['name']}({plan['code']}) 买入参考 {plan['buy_ref']}，建议股数 {plan['position_size']}，预估净利 {plan['net_min']}~{plan['net_max']} 元")
 
 log_file = "trade_log.csv"
 file_exists = os.path.isfile(log_file)
@@ -670,7 +868,12 @@ try:
                        "net_min": plan["net_min"], "net_max": plan["net_max"], "signals": plan["signals"],
                        "win_rate": plan["win_rate"], "hit_250": plan["hit_250"], "hit_350": plan["hit_350"],
                        "final_score": plan["final_score"], "market_pct": market_pct,
-                       "position_ratio": suggested_position_ratio}
+                       "position_ratio": suggested_position_ratio,
+                       "market_bias": market_bias,
+                       "market_trend": market_trend,
+                       "market_volatility": market_volatility,
+                       "position_size": plan["position_size"],
+                       "defensive_mode": defensive_mode}
             if writer is None:
                 writer = csv.DictWriter(f, fieldnames=list(log_row.keys()))
                 if not file_exists: writer.writeheader()
