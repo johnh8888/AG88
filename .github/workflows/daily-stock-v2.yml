@@ -1,10 +1,10 @@
+# .github/workflows/stock_selector.yml
 name: A股短线选股系统 V3.0
 
-于:
+on:
   schedule:
-    # UTC 01:35 = 北京时间 09:35
+    # UTC 01:35 = 北京时间 09:35（周一至周五）
     - cron: "35 1 * * 1-5"
-
   workflow_dispatch:
 
 jobs:
@@ -13,66 +13,46 @@ jobs:
 
     env:
       PYTHONUNBUFFERED: "1"
-      TEST_MODE: "0"
+      TZ: "Asia/Shanghai"
 
     steps:
-      # =========================
-      # 1. 拉取代码
-      # =========================
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # =========================
-      # 2. Python环境
-      # =========================
       - name: Setup Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
           cache: "pip"
 
-      # =========================
-      # 3. 安装依赖
-      # =========================
       - name: Install dependencies
         run: |
           set -e
           python -m pip install --upgrade pip
           pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
-            akshare efinance pandas numpy requests tenacity
+            akshare efinance pandas numpy requests tenacity scipy
 
-      # =========================
-      # 4. 运行策略（带重试）
-      # =========================
-      - name: Run strategy
+      - name: Run strategy (with retry)
         run: |
           set -e
           for i in 1 2 3; do
             echo "Attempt $i running..."
-            python stock_recommender_conservative_v2.py && break
-            echo "Attempt $i failed, retrying..."
+            python stock_selector_v4.py && break
+            echo "Attempt $i failed, retrying in 10s..."
             sleep 10
           done
 
-      # =========================
-      # 5. 检查输出
-      # =========================
       - name: Validate output
         run: |
           echo "===== FILES ====="
           ls -lh
-
           if [ ! -f selected_stocks.csv ]; then
             echo "ERROR: selected_stocks.csv not found"
             exit 1
           fi
-
-          echo "===== RESULT ====="
+          echo "===== SELECTED STOCKS ====="
           cat selected_stocks.csv
 
-      # =========================
-      # 6. 上传结果
-      # =========================
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -82,9 +62,6 @@ jobs:
             last_spot_snapshot.csv
           retention-days: 14
 
-      # =========================
-      # 7. 日志（无论成功失败都执行）
-      # =========================
       - name: Save logs
         if: always()
         run: |
