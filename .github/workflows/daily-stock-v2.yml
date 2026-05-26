@@ -2,7 +2,7 @@ name: A股短线选股系统 V3.0
 
 于:
   schedule:
-    # 北京时间 09:35 = UTC 01:35
+    # UTC 01:35 = 北京时间 09:35
     - cron: "35 1 * * 1-5"
 
   workflow_dispatch:
@@ -16,61 +16,63 @@ jobs:
       TEST_MODE: "0"
 
     steps:
-      # =====================
-      # 1. 拉代码
-      # =====================
-      - name: Checkout
+      # =========================
+      # 1. 拉取代码
+      # =========================
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # =====================
+      # =========================
       # 2. Python环境
-      # =====================
-      - name: Setup Python
+      # =========================
+      - name: Setup Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
           cache: "pip"
 
-      # =====================
-      # 3. 依赖安装（稳定版）
-      # =====================
+      # =========================
+      # 3. 安装依赖
+      # =========================
       - name: Install dependencies
         run: |
+          set -e
           python -m pip install --upgrade pip
           pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
             akshare efinance pandas numpy requests tenacity
 
-      # =====================
-      # 4. 运行脚本（带重试）
-      # =====================
-      - name: Run stock selection (retry safe)
+      # =========================
+      # 4. 运行策略（带重试）
+      # =========================
+      - name: Run strategy
         run: |
+          set -e
           for i in 1 2 3; do
-            echo "Run attempt $i"
+            echo "Attempt $i running..."
             python stock_recommender_conservative_v2.py && break
-            echo "Failed attempt $i, retrying..."
+            echo "Attempt $i failed, retrying..."
             sleep 10
           done
 
-      # =====================
-      # 5. 结果检查
-      # =====================
-      - name: Check output
+      # =========================
+      # 5. 检查输出
+      # =========================
+      - name: Validate output
         run: |
-          echo "===== FILE LIST ====="
+          echo "===== FILES ====="
           ls -lh
 
           if [ ! -f selected_stocks.csv ]; then
-            echo "❌ No output generated"
+            echo "ERROR: selected_stocks.csv not found"
             exit 1
           fi
 
-          echo "===== RESULTS ====="
+          echo "===== RESULT ====="
           cat selected_stocks.csv
 
-      # =====================
+      # =========================
       # 6. 上传结果
-      # =====================
+      # =========================
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -80,9 +82,9 @@ jobs:
             last_spot_snapshot.csv
           retention-days: 14
 
-      # =====================
-      # 7. 保存运行日志
-      # =====================
+      # =========================
+      # 7. 日志（无论成功失败都执行）
+      # =========================
       - name: Save logs
         if: always()
         run: |
