@@ -1,13 +1,13 @@
-# ======================
-# A股短线选股系统 V3.0 工作流
-# 每个交易日 09:35 自动运行，亦可手动触发
-# ======================
+# =========================
+# A股每日单股精选 V1.0 工作流
+# 每个交易日 09:35 (北京时间) 自动运行，亦可手动触发
+# =========================
 
-name: A股短线选股系统 V3.0
+name: A股每日单股精选 V1.0
 
 on:
   schedule:
-    # UTC 01:35 = 北京时间 09:35 （周一到周五）
+    # UTC 01:35 = 北京时间 09:35（仅工作日）
     - cron: "35 1 * * 1-5"
   # 允许手动运行
   workflow_dispatch:
@@ -15,47 +15,36 @@ on:
 jobs:
   stock-selection:
     runs-on: ubuntu-latest
-    # 设置时区为上海，避免日期偏差
     env:
-      PYTHONUNBUFFERED: "1"     # 日志实时输出
-      TZ: "Asia/Shanghai"
-      TEST_MODE: "0"            # 设为 1 则仅跑前200只股票用于测试
+      PYTHONUNBUFFERED: "1"      # 日志实时输出
+      TZ: "Asia/Shanghai"        # 时区
 
     steps:
-      # ----------------------------------
       # 1. 拉取仓库代码
-      # ----------------------------------
       - name: 拉取代码
         uses: actions/checkout@v4
 
-      # ----------------------------------
-      # 2. 安装 Python 环境
-      # ----------------------------------
+      # 2. 安装 Python
       - name: 安装 Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
           cache: "pip"
 
-      # ----------------------------------
-      # 3. 安装依赖
-      # ----------------------------------
+      # 3. 安装依赖（baostock + pandas + numpy）
       - name: 安装依赖包
         run: |
           set -e
           python -m pip install --upgrade pip
-          pip install -i https://pypi.tuna.tsinghua.edu.cn/simple \
-            akshare pandas numpy requests tenacity scipy efinance
+          pip install baostock pandas numpy
 
-      # ----------------------------------
-      # 4. 运行策略（最多重试3次）
-      # ----------------------------------
+      # 4. 运行选股脚本（最多重试3次）
       - name: 运行选股策略
         run: |
           set -e
           for i in 1 2 3; do
             echo "【第 $i 次尝试】开始运行..."
-            python stock_selector_v4.py 2>&1 | tee run.log
+            python daily_pick_v1.py 2>&1 | tee run.log
             # 检查脚本退出码
             if [ ${PIPESTATUS[0]} -eq 0 ]; then
               echo "✅ 运行成功！"
@@ -65,9 +54,7 @@ jobs:
             sleep 10
           done
 
-      # ----------------------------------
-      # 5. 检查必需文件
-      # ----------------------------------
+      # 5. 验证输出文件（只需 selected_stocks.csv）
       - name: 验证输出文件
         run: |
           echo "========== 当前目录文件 =========="
@@ -79,21 +66,15 @@ jobs:
           echo "========== 选股结果预览 =========="
           cat selected_stocks.csv
 
-      # ----------------------------------
-      # 6. 上传结果（制品保存14天）
-      # ----------------------------------
-      - name: 上传结果文件
+      # 6. 上传结果文件（制品保存14天）
+      - name: 上传选股结果
         uses: actions/upload-artifact@v4
         with:
           name: 选股结果
-          path: |
-            selected_stocks.csv
-            last_spot_snapshot.csv
+          path: selected_stocks.csv
           retention-days: 14
 
-      # ----------------------------------
-      # 7. 保存日志（无论成败均执行）
-      # ----------------------------------
+      # 7. 保存运行日志（无论成败均执行）
       - name: 保存运行日志
         if: always()
         run: |
