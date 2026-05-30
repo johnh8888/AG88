@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # =========================
-# A股每日单股精选 V1.0
-# 数据源：Baostock（境外IP可用，免费）
-# 过滤：创业板(300xxx)、北交所(8/4开头)、ST/*ST
-# 策略：动量 + 低波动 + 资金流入，给出持有天数建议
+# A股每日单股精选 V2.0（带回测功能）
+# 数据源：Baostock（免费，境外IP可用）
+# 策略：动量 + 低波动 + 资金流入
+# 新增：完整回测引擎 + 参数优化建议
 # 依赖：pip install baostock pandas numpy
 # =========================
 
@@ -14,6 +14,8 @@ import baostock as bs
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
+from collections import defaultdict
+import os
 
 warnings.filterwarnings("ignore")
 
@@ -21,26 +23,36 @@ warnings.filterwarnings("ignore")
 # 配置
 # =========================
 class CFG:
-    TOTAL_CAPITAL  = 20000      # 总资金（元），建议2万起
-    LOOKBACK_DAYS  = 90         # 历史拉取天数
-    MAX_STOCKS     = 300        # 最多分析股票数量
-    PRICE_LOW      = 5          # 最低股价（剔除仙股）
-    PRICE_HIGH     = 150        # 最高股价（1手不超过1.5万）
-    MIN_AMOUNT     = 1e8        # 最低日均成交额1亿（保证流动性）
-    COMMISSION     = 0.0003     # 手续费（买卖各0.03%，印花税卖方0.1%）
-    SELL_TAX       = 0.001      # 印花税（卖方）
-    STOP_LOSS      = -0.05      # 止损线 -5%
-    TARGET_PROFIT  = 0.03       # 目标涨幅 +3%（1万本金赚300元）
+    TOTAL_CAPITAL  = 20000      # 总资金
+    LOOKBACK_DAYS  = 365        # 回测时拉取更多历史数据
+    MAX_STOCKS     = 500        # 回测用更多股票
+    PRICE_LOW      = 5
+    PRICE_HIGH     = 150
+    MIN_AMOUNT     = 1e8
+    COMMISSION     = 0.0003
+    SELL_TAX       = 0.001
+    STOP_LOSS      = -0.05      # 止损
+    TARGET_PROFIT  = 0.03       # 止盈
+    MAX_HOLD_DAYS  = 5          # 最大持有天数
+    SLIPPAGE       = 0.001      # 滑点（0.1%）
+    POSITION_PCT   = 0.8        # 仓位比例
 
 
 # =========================
-# Baostock 登录
+# Baostock 登录/登出
 # =========================
 def bs_login():
-    result = bs.login()
-    if result.error_code != "0":
-        raise RuntimeError(f"Baostock登录失败: {result.error_msg}")
-    print("✅ Baostock 登录成功")
+    for attempt in range(3):
+        try:
+            result = bs.login()
+            if result.error_code == "0":
+                print("✅ Baostock 登录成功")
+                return True
+        except:
+            pass
+        print(f"⚠️ 登录重试 {attempt+1}/3...")
+        time.sleep(2)
+    raise RuntimeError("Baostock 登录失败")
 
 def bs_logout():
     try:
@@ -50,11 +62,10 @@ def bs_logout():
 
 
 # =========================
-# 获取沪深主板股票列表
-# 过滤：创业板(sz.3)、北交所(bj.)、ST
+# 获取股票列表
 # =========================
 def get_stock_list():
-    print("🌐 获取股票列表（过滤创业板/北交所/ST）...")
+    print("🌐 获取股票列表...")
     rs = bs.query_stock_basic(code_name="")
     rows = []
     while rs.error_code == "0" and rs.next():
@@ -64,24 +75,14 @@ def get_stock_list():
         raise RuntimeError("无法获取股票列表")
 
     df = pd.DataFrame(rows, columns=rs.fields)
-
-    # 只保留上市状态的股票
-    df = df[df["type"] == "1"]       # 股票类型
-    df = df[df["status"] == "1"]     # 上市中
-
-    # 过滤创业板（sz.300xxx / sz.301xxx）
-    df = df[~df["code"].str.startswith("sz.3")]
-
-    # 过滤北交所（bj. 开头）
-    df = df[~df["code"].str.startswith("bj.")]
-
-    # 过滤科创板（sh.688xxx）- 风险较高，可按需开放
-    df = df[~df["code"].str.startswith("sh.688")]
-
-    # 过滤ST / *ST（名称含ST）
+    df = df[df["type"] == "1"]
+    df = df[df["status"] == "1"]
+    df = df[~df["code"].str.startswith("sz.3")]   # 创业板
+    df = df[~df["code"].str.startswith("bj.")]     # 北交所
+    df = df[~df["code"].str.startswith("sh.688")]  # 科创板
     df = df[~df["code_name"].str.contains("ST", na=False)]
 
-    print(f"✅ 过滤后剩余 {len(df)} 支主板股票")
+    print(f"✅ 过滤后 {len(df)} 支股票")
     return df.reset_index(drop=True)
 
 
@@ -96,7 +97,7 @@ def fetch_hist(code, start_date, end_date):
             start_date=start_date,
             end_date=end_date,
             frequency="d",
-            adjustflag="2"  # 前复权
+            adjustflag="2"
         )
         rows = []
         while rs.error_code == "0" and rs.next():
@@ -113,216 +114,447 @@ def fetch_hist(code, start_date, end_date):
         return None
 
 
-def get_hist(stock_list, start_date, end_date, max_stocks=300):
+def get_all_hist(stock_list, start_date, end_date, max_stocks=300):
     codes = stock_list["code"].tolist()[:max_stocks]
     frames = []
     print(f"📡 拉取历史数据（{len(codes)} 支）...")
     for i, code in enumerate(codes):
         df = fetch_hist(code, start_date, end_date)
-        if df is not None and len(df) >= 20:
+        if df is not None and len(df) >= 60:
             frames.append(df)
         if i % 10 == 0:
             time.sleep(0.15)
         if (i + 1) % 100 == 0:
-            print(f"  进度 {i+1}/{len(codes)}，已获取 {len(frames)} 支...")
-    print(f"✅ 完成，有效数据 {len(frames)} 支")
+            print(f"  进度 {i+1}/{len(codes)}，已获取 {len(frames)} 支")
+    print(f"✅ 有效数据 {len(frames)} 支")
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 # =========================
-# 因子计算（针对短线优化）
+# 因子计算（给定日期截面的因子值）
 # =========================
-def calc_factors(df, name_map):
+def calc_factors_cross_section(df_full, target_date):
+    """计算 target_date 当天所有股票的因子截面"""
+    df = df_full[df_full["date"] <= target_date].copy()
     if df.empty:
         return pd.DataFrame()
 
     df = df.sort_values(["code", "date"])
 
-    # 短线动量（3日、5日）
+    # 动量
     df["mom_3"]  = df.groupby("code")["close"].pct_change(3)
     df["mom_5"]  = df.groupby("code")["close"].pct_change(5)
 
     # 波动率（10日）
-    df["vol_10"] = df.groupby("code")["close"].pct_change().rolling(10).std()
+    df["vol_10"] = df.groupby("code")["close"].pct_change().rolling(10).std().reset_index(level=0, drop=True)
 
-    # 成交额（5日均值）
+    # 成交额5日均值
     df["amt_5"]  = df.groupby("code")["amount"].transform(lambda x: x.rolling(5).mean())
 
-    # 量比：今日成交量 / 5日均量（>1说明放量）
+    # 量比
     df["vol_ma5"]   = df.groupby("code")["volume"].transform(lambda x: x.rolling(5).mean())
     df["vol_ratio"] = df["volume"] / df["vol_ma5"].replace(0, np.nan)
 
     # 今日涨跌幅
     df["today_pct"] = df.groupby("code")["close"].pct_change(1)
 
-    # 价格趋势：收盘价 / 20日均线
-    df["ma20"]      = df.groupby("code")["close"].transform(lambda x: x.rolling(20).mean())
-    df["above_ma20"]= (df["close"] > df["ma20"]).astype(float)
+    # 20日均线
+    df["ma20"] = df.groupby("code")["close"].transform(lambda x: x.rolling(20).mean())
+    df["above_ma20"] = (df["close"] > df["ma20"]).astype(float)
 
-    # 取最新一行
-    latest = df.groupby("code").tail(1).copy()
-    latest["名称"] = latest["code"].map(name_map).fillna("未知")
-    latest["code_simple"] = latest["code"].str.replace("sh.", "").str.replace("sz.", "")
+    # 取目标日期数据
+    latest = df[df["date"] == target_date].copy()
+    latest = latest.dropna(subset=["mom_3", "mom_5", "vol_10", "amt_5", "vol_ratio", "today_pct"])
 
-    latest = latest.dropna(subset=["mom_3", "mom_5", "vol_10", "amt_5", "vol_ratio"])
-
-    # 过滤价格范围
+    # 过滤
     latest = latest[latest["close"] >= CFG.PRICE_LOW]
     latest = latest[latest["close"] <= CFG.PRICE_HIGH]
-
-    # 过滤低流动性
     latest = latest[latest["amt_5"] >= CFG.MIN_AMOUNT]
-
-    # 过滤今日跌停附近（跌幅超过9%不选，可能有异常）
     latest = latest[latest["today_pct"] > -0.09]
-
-    # 过滤在均线下方太多的（跌势中的股票）
     latest = latest[latest["above_ma20"] == 1]
 
-    return latest.reset_index(drop=True)
+    if latest.empty:
+        return latest
 
-
-# =========================
-# 综合评分（短线）
-# =========================
-def score_short(df):
+    # 评分
     def zscore(s):
         std = s.std()
         return (s - s.mean()) / std if std > 0 else s * 0
 
-    df = df.copy()
-    df["z_mom3"]      = zscore(df["mom_3"])
-    df["z_mom5"]      = zscore(df["mom_5"])
-    df["z_vol"]       = -zscore(df["vol_10"])     # 低波动高分
-    df["z_amt"]       = zscore(df["amt_5"])
-    df["z_vol_ratio"] = zscore(df["vol_ratio"])   # 放量高分
+    latest = latest.copy()
+    latest["z_mom3"]      = zscore(latest["mom_3"])
+    latest["z_mom5"]      = zscore(latest["mom_5"])
+    latest["z_vol"]       = -zscore(latest["vol_10"])
+    latest["z_amt"]       = zscore(latest["amt_5"])
+    latest["z_vol_ratio"] = zscore(latest["vol_ratio"])
 
-    # 权重：短期动量最重要，放量次之，低波动保稳定
-    df["score"] = (
-        df["z_mom3"]      * 0.30 +
-        df["z_mom5"]      * 0.20 +
-        df["z_vol"]       * 0.20 +
-        df["z_amt"]       * 0.15 +
-        df["z_vol_ratio"] * 0.15
+    latest["score"] = (
+        latest["z_mom3"]      * 0.30 +
+        latest["z_mom5"]      * 0.20 +
+        latest["z_vol"]       * 0.20 +
+        latest["z_amt"]       * 0.15 +
+        latest["z_vol_ratio"] * 0.15
     )
-    return df.sort_values("score", ascending=False)
+
+    return latest.sort_values("score", ascending=False)
 
 
 # =========================
-# 持有天数建议（基于动量强度）
+# 回测引擎
 # =========================
-def suggest_hold_days(row):
-    mom3 = row.get("mom_3", 0)
-    vol_r = row.get("vol_ratio", 1)
-    vol10 = row.get("vol_10", 0.02)
+class BacktestEngine:
+    def __init__(self, df_full, start_date, end_date):
+        self.df_full = df_full
+        self.start_date = start_date
+        self.end_date = end_date
+        self.trades = []           # 每笔交易记录
+        self.daily_equity = []     # 每日净值
 
-    # 强势突破：短线1-2天
-    if mom3 > 0.04 and vol_r > 1.5:
-        return 1, "强势突破，短线1天目标止盈"
+    def get_trading_dates(self):
+        """获取回测区间内的所有交易日"""
+        dates = self.df_full["date"].unique()
+        dates = sorted(dates)
+        dates = [d for d in dates if self.start_date <= d <= self.end_date]
+        return dates
 
-    # 温和上涨 + 放量：持有2-3天
-    if mom3 > 0.01 and vol_r > 1.2:
-        return 2, "温和放量，建议持有2天"
+    def simulate_trade(self, code, buy_date, buy_price, shares, capital):
+        """模拟单笔交易：从买入日起跟踪到卖出日"""
+        stock_data = self.df_full[
+            (self.df_full["code"] == code) &
+            (self.df_full["date"] >= buy_date)
+        ].sort_values("date")
 
-    # 低波动稳健型：持有3-5天
-    if vol10 < 0.015 and mom3 > 0:
-        return 4, "低波动稳健，建议持有3-5天"
+        if stock_data.empty or len(stock_data) < 2:
+            return None
 
-    # 默认2天
-    return 2, "综合评估，建议持有2天"
+        buy_row = stock_data.iloc[0]
+        actual_buy_price = buy_price * (1 + CFG.SLIPPAGE)  # 买入滑点
+        buy_cost = shares * actual_buy_price * (1 + CFG.COMMISSION)
+
+        for i in range(1, len(stock_data)):
+            row = stock_data.iloc[i]
+            hold_days = i
+
+            # 达到最大持有天数，强制卖出
+            if hold_days >= CFG.MAX_HOLD_DAYS:
+                sell_price = row["close"] * (1 - CFG.SLIPPAGE)
+                sell_revenue = shares * sell_price * (1 - CFG.COMMISSION - CFG.SELL_TAX)
+                return {
+                    "code": code,
+                    "buy_date": buy_date,
+                    "sell_date": row["date"],
+                    "hold_days": hold_days,
+                    "buy_price": actual_buy_price,
+                    "sell_price": sell_price,
+                    "shares": shares,
+                    "cost": buy_cost,
+                    "revenue": sell_revenue,
+                    "profit": sell_revenue - buy_cost,
+                    "profit_pct": (sell_revenue - buy_cost) / buy_cost,
+                    "exit_reason": "到期卖出"
+                }
+
+            # 止损检查
+            if row["low"] <= buy_price * (1 + CFG.STOP_LOSS):
+                stop_price = buy_price * (1 + CFG.STOP_LOSS)
+                actual_stop = min(stop_price, row["open"]) * (1 - CFG.SLIPPAGE)
+                sell_revenue = shares * actual_stop * (1 - CFG.COMMISSION - CFG.SELL_TAX)
+                return {
+                    "code": code,
+                    "buy_date": buy_date,
+                    "sell_date": row["date"],
+                    "hold_days": hold_days,
+                    "buy_price": actual_buy_price,
+                    "sell_price": actual_stop,
+                    "shares": shares,
+                    "cost": buy_cost,
+                    "revenue": sell_revenue,
+                    "profit": sell_revenue - buy_cost,
+                    "profit_pct": (sell_revenue - buy_cost) / buy_cost,
+                    "exit_reason": "止损"
+                }
+
+            # 止盈检查
+            if row["high"] >= buy_price * (1 + CFG.TARGET_PROFIT):
+                target_price = buy_price * (1 + CFG.TARGET_PROFIT)
+                actual_target = max(target_price, row["open"]) * (1 - CFG.SLIPPAGE)
+                sell_revenue = shares * actual_target * (1 - CFG.COMMISSION - CFG.SELL_TAX)
+                return {
+                    "code": code,
+                    "buy_date": buy_date,
+                    "sell_date": row["date"],
+                    "hold_days": hold_days,
+                    "buy_price": actual_buy_price,
+                    "sell_price": actual_target,
+                    "shares": shares,
+                    "cost": buy_cost,
+                    "revenue": sell_revenue,
+                    "profit": sell_revenue - buy_cost,
+                    "profit_pct": (sell_revenue - buy_cost) / buy_cost,
+                    "exit_reason": "止盈"
+                }
+
+        # 数据走完未触发条件，以最后一天收盘价卖出
+        last_row = stock_data.iloc[-1]
+        sell_price = last_row["close"] * (1 - CFG.SLIPPAGE)
+        sell_revenue = shares * sell_price * (1 - CFG.COMMISSION - CFG.SELL_TAX)
+        return {
+            "code": code,
+            "buy_date": buy_date,
+            "sell_date": last_row["date"],
+            "hold_days": len(stock_data) - 1,
+            "buy_price": actual_buy_price,
+            "sell_price": sell_price,
+            "shares": shares,
+            "cost": buy_cost,
+            "revenue": sell_revenue,
+            "profit": sell_revenue - buy_cost,
+            "profit_pct": (sell_revenue - buy_cost) / buy_cost,
+            "exit_reason": "数据结束"
+        }
+
+    def run(self, top_k=1, capital=20000):
+        """执行回测"""
+        dates = self.get_trading_dates()
+        print(f"\n🔬 回测期间: {dates[0]} ~ {dates[-1]}，共 {len(dates)} 个交易日")
+
+        cash = capital
+        holding = None  # 当前持仓: {"code", "shares", "buy_date", "buy_price"}
+        equity_curve = []
+
+        for i, today in enumerate(dates):
+            # 先检查是否有持仓需要处理
+            if holding is not None:
+                stock_data = self.df_full[
+                    (self.df_full["code"] == holding["code"]) &
+                    (self.df_full["date"] >= holding["buy_date"]) &
+                    (self.df_full["date"] <= today)
+                ].sort_values("date")
+
+                sell_now = False
+                sell_reason = ""
+
+                if len(stock_data) > 0:
+                    last = stock_data.iloc[-1]
+                    hold_days = len(stock_data) - 1
+
+                    # 止损
+                    if last["low"] <= holding["buy_price"] * (1 + CFG.STOP_LOSS):
+                        sell_now = True
+                        sell_reason = "止损"
+                        sell_price = holding["buy_price"] * (1 + CFG.STOP_LOSS)
+                    # 止盈
+                    elif last["high"] >= holding["buy_price"] * (1 + CFG.TARGET_PROFIT):
+                        sell_now = True
+                        sell_reason = "止盈"
+                        sell_price = holding["buy_price"] * (1 + CFG.TARGET_PROFIT)
+                    # 到期
+                    elif hold_days >= CFG.MAX_HOLD_DAYS:
+                        sell_now = True
+                        sell_reason = "到期"
+                        sell_price = last["close"]
+
+                if sell_now:
+                    actual_sell = sell_price * (1 - CFG.SLIPPAGE)
+                    revenue = holding["shares"] * actual_sell * (1 - CFG.COMMISSION - CFG.SELL_TAX)
+                    profit = revenue - holding["cost"]
+                    self.trades.append({
+                        "code": holding["code"],
+                        "buy_date": holding["buy_date"],
+                        "sell_date": today,
+                        "hold_days": len(stock_data) - 1 if len(stock_data) > 0 else 0,
+                        "buy_price": holding["buy_price"],
+                        "sell_price": actual_sell,
+                        "shares": holding["shares"],
+                        "cost": holding["cost"],
+                        "revenue": revenue,
+                        "profit": profit,
+                        "profit_pct": profit / holding["cost"],
+                        "exit_reason": sell_reason
+                    })
+                    cash += revenue
+                    holding = None
+
+            # 无持仓时选股买入
+            if holding is None:
+                candidates = calc_factors_cross_section(self.df_full, today)
+                if not candidates.empty and len(candidates) >= top_k:
+                    best = candidates.iloc[0]
+                    budget = cash * CFG.POSITION_PCT
+                    shares = int(budget / (best["close"] * (1 + CFG.SLIPPAGE)) / 100) * 100
+                    shares = max(shares, 100)
+
+                    if shares * best["close"] <= budget:
+                        buy_price = best["close"] * (1 + CFG.SLIPPAGE)
+                        cost = shares * buy_price * (1 + CFG.COMMISSION)
+                        if cost <= cash:
+                            cash -= cost
+                            holding = {
+                                "code": best["code"],
+                                "shares": shares,
+                                "buy_date": today,
+                                "buy_price": buy_price,
+                                "cost": cost
+                            }
+
+            # 记录每日净值
+            if holding is not None:
+                stock_data_today = self.df_full[
+                    (self.df_full["code"] == holding["code"]) &
+                    (self.df_full["date"] <= today)
+                ]
+                if not stock_data_today.empty:
+                    unrealized_value = holding["shares"] * stock_data_today.iloc[-1]["close"]
+                else:
+                    unrealized_value = holding["cost"]
+                equity = cash + unrealized_value
+            else:
+                equity = cash
+
+            equity_curve.append({"date": today, "equity": equity})
+
+            if (i + 1) % 50 == 0:
+                print(f"  回测进度: {i+1}/{len(dates)}")
+
+        # 最终清仓
+        if holding is not None:
+            last_data = self.df_full[self.df_full["code"] == holding["code"]]
+            if not last_data.empty:
+                last_close = last_data.iloc[-1]["close"]
+                sell_price = last_close * (1 - CFG.SLIPPAGE)
+                revenue = holding["shares"] * sell_price * (1 - CFG.COMMISSION - CFG.SELL_TAX)
+                profit = revenue - holding["cost"]
+                self.trades.append({
+                    "code": holding["code"],
+                    "buy_date": holding["buy_date"],
+                    "sell_date": equity_curve[-1]["date"],
+                    "hold_days": 0,
+                    "buy_price": holding["buy_price"],
+                    "sell_price": sell_price,
+                    "shares": holding["shares"],
+                    "cost": holding["cost"],
+                    "revenue": revenue,
+                    "profit": profit,
+                    "profit_pct": profit / holding["cost"],
+                    "exit_reason": "回测结束清仓"
+                })
+                cash += revenue
+
+        self.equity_curve = pd.DataFrame(equity_curve)
+        return self.generate_report(capital)
+
+    def generate_report(self, initial_capital):
+        """生成回测报告"""
+        trades_df = pd.DataFrame(self.trades)
+        equity_df = self.equity_curve
+
+        if trades_df.empty:
+            return {"error": "无交易记录"}
+
+        # 基本统计
+        total_trades = len(trades_df)
+        win_trades = len(trades_df[trades_df["profit"] > 0])
+        loss_trades = len(trades_df[trades_df["profit"] <= 0])
+        win_rate = win_trades / total_trades * 100 if total_trades > 0 else 0
+
+        total_profit = trades_df["profit"].sum()
+        avg_profit = trades_df["profit"].mean()
+        max_profit = trades_df["profit"].max()
+        max_loss = trades_df["profit"].min()
+        avg_hold_days = trades_df["hold_days"].mean()
+
+        # 盈亏比
+        avg_win = trades_df[trades_df["profit"] > 0]["profit"].mean() if win_trades > 0 else 0
+        avg_loss = abs(trades_df[trades_df["profit"] <= 0]["profit"].mean()) if loss_trades > 0 else 1
+        profit_factor = avg_win / avg_loss if avg_loss > 0 else float("inf")
+
+        # 收益率
+        final_equity = equity_df.iloc[-1]["equity"]
+        total_return = (final_equity - initial_capital) / initial_capital * 100
+
+        # 最大回撤
+        equity_df["cummax"] = equity_df["equity"].cummax()
+        equity_df["drawdown"] = (equity_df["equity"] - equity_df["cummax"]) / equity_df["cummax"]
+        max_drawdown = equity_df["drawdown"].min() * 100
+
+        # 夏普比率（简化版，按日计算）
+        equity_df["daily_return"] = equity_df["equity"].pct_change()
+        sharpe_ratio = (equity_df["daily_return"].mean() / equity_df["daily_return"].std() * np.sqrt(252)
+                        if equity_df["daily_return"].std() > 0 else 0)
+
+        # 退出原因统计
+        exit_reasons = trades_df["exit_reason"].value_counts().to_dict()
+
+        report = {
+            "初始资金": initial_capital,
+            "最终资金": round(final_equity, 2),
+            "总收益率": f"{total_return:.2f}%",
+            "年化收益率": f"{total_return / (len(equity_df)/252):.2f}%" if len(equity_df) > 0 else "N/A",
+            "最大回撤": f"{max_drawdown:.2f}%",
+            "夏普比率": f"{sharpe_ratio:.2f}",
+            "总交易次数": total_trades,
+            "盈利次数": win_trades,
+            "亏损次数": loss_trades,
+            "胜率": f"{win_rate:.2f}%",
+            "总盈亏": round(total_profit, 2),
+            "平均盈亏": round(avg_profit, 2),
+            "最大单笔盈利": round(max_profit, 2),
+            "最大单笔亏损": round(max_loss, 2),
+            "盈亏比": f"{profit_factor:.2f}",
+            "平均持有天数": f"{avg_hold_days:.1f}",
+            "退出原因分布": exit_reasons
+        }
+
+        return report
 
 
 # =========================
-# 计算买入/卖出金额
+# 实盘选股（保留原功能）
 # =========================
-def calc_trade(row, capital):
-    price     = row["close"]
-    # 按资金80%买入（留20%备用）
-    budget    = capital * 0.80
-    shares    = int(budget / price / 100) * 100  # 整手
-    shares    = max(shares, 100)                  # 至少1手
+def daily_selection(stock_list, name_map, end_date):
+    """在给定日期进行选股"""
+    start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=CFG.LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    hist = get_all_hist(stock_list, start_date, end_date, CFG.MAX_STOCKS)
 
-    # 实际买入
-    buy_amt   = shares * price
-    buy_fee   = buy_amt * CFG.COMMISSION
-    buy_total = buy_amt + buy_fee
+    if hist.empty:
+        return None
 
-    # 止损卖出
-    sl_price  = round(price * (1 + CFG.STOP_LOSS), 2)
-    sl_amt    = shares * sl_price
-    sl_fee    = sl_amt * (CFG.COMMISSION + CFG.SELL_TAX)
-    sl_net    = sl_amt - sl_fee
-    sl_loss   = sl_net - buy_total
+    candidates = calc_factors_cross_section(hist, end_date)
+    if candidates.empty:
+        return None
 
-    # 目标卖出
-    tgt_price = round(price * (1 + CFG.TARGET_PROFIT), 2)
-    tgt_amt   = shares * tgt_price
-    tgt_fee   = tgt_amt * (CFG.COMMISSION + CFG.SELL_TAX)
-    tgt_net   = tgt_amt - tgt_fee
-    tgt_profit= tgt_net - buy_total
+    # 资金过滤
+    budget = CFG.TOTAL_CAPITAL * CFG.POSITION_PCT
+    candidates = candidates[candidates["close"] * 100 <= budget]
 
-    return {
-        "shares": shares,
-        "buy_price": price,
-        "buy_amt": round(buy_amt, 2),
-        "buy_fee": round(buy_fee, 2),
-        "buy_total": round(buy_total, 2),
-        "sl_price": sl_price,
-        "sl_net": round(sl_net, 2),
-        "sl_loss": round(sl_loss, 2),
-        "tgt_price": tgt_price,
-        "tgt_net": round(tgt_net, 2),
-        "tgt_profit": round(tgt_profit, 2),
-    }
+    if candidates.empty:
+        return None
+
+    candidates["名称"] = candidates["code"].map(name_map).fillna("未知")
+    candidates["code_simple"] = candidates["code"].str.replace("sh.", "").str.replace("sz.", "")
+
+    return candidates.head(10)
 
 
 # =========================
-# 主输出：每日单股推荐
+# 打印回测报告
 # =========================
-def print_daily_pick(best_row, trade, hold_days, hold_reason, top5_df):
-    today = datetime.now().strftime("%Y-%m-%d")
+def print_report(report):
     print("\n" + "="*60)
-    print(f"  📅 {today}  每日精选股票")
+    print("  📊 回测报告")
     print("="*60)
-    print(f"\n  🏆 今日推荐：【{best_row['code_simple']} {best_row['名称']}】")
-    print(f"\n  📊 股票指标")
-    print(f"    当前价格   : {best_row['close']:.2f} 元")
-    print(f"    今日涨跌   : {best_row['today_pct']*100:+.2f}%")
-    print(f"    3日动量    : {best_row['mom_3']*100:+.2f}%")
-    print(f"    量比       : {best_row['vol_ratio']:.2f}x  {'🔥放量' if best_row['vol_ratio']>1.3 else '正常'}")
-    print(f"    综合评分   : {best_row['score']:.3f}")
+    if "error" in report:
+        print(f"  ❌ {report['error']}")
+        return
 
-    print(f"\n  💰 交易建议（总资金 {CFG.TOTAL_CAPITAL:,.0f} 元）")
-    print(f"    ✅ 买入    : {trade['shares']} 股 @ {trade['buy_price']:.2f} 元")
-    print(f"               实付金额: {trade['buy_total']:,.0f} 元（含手续费 {trade['buy_fee']:.1f} 元）")
-    print(f"    🕐 持有    : {hold_days} 天  ─  {hold_reason}")
-    print(f"    🟢 目标卖出: {trade['tgt_price']:.2f} 元（+{CFG.TARGET_PROFIT*100:.0f}%）")
-    print(f"               到手金额: {trade['tgt_net']:,.0f} 元  预期盈利: +{trade['tgt_profit']:,.0f} 元")
-    print(f"    🔴 止损卖出: {trade['sl_price']:.2f} 元（{CFG.STOP_LOSS*100:.0f}%）")
-    print(f"               到手金额: {trade['sl_net']:,.0f} 元  最大亏损: {trade['sl_loss']:,.0f} 元")
+    for key, value in report.items():
+        if key != "退出原因分布":
+            print(f"  {key:<16}: {value}")
+        else:
+            print(f"  {key:<16}:")
+            for reason, count in value.items():
+                print(f"    {reason}: {count}次")
 
-    profit_pct = trade['tgt_profit'] / trade['buy_total'] * 100
-    loss_pct   = trade['sl_loss'] / trade['buy_total'] * 100
-    print(f"\n  📐 盈亏比   : {abs(trade['tgt_profit'])/abs(trade['sl_loss']):.1f}:1  "
-          f"（盈{profit_pct:.1f}% / 亏{abs(loss_pct):.1f}%）")
-
-    print(f"\n  ⚠️  操作提示:")
-    print(f"    · 明日开盘后观察，若高开超过1%建议等回调再买")
-    print(f"    · 若开盘即跌破 {trade['sl_price']:.2f} 元，放弃当日操作")
-    print(f"    · 达到目标价 {trade['tgt_price']:.2f} 元果断卖出，不贪")
-    print(f"    · A股T+1，今日买入最快明日卖出")
-
-    print(f"\n  📋 备选股票 TOP5（可在今日推荐无法操作时使用）")
-    print(f"  {'代码':<8} {'名称':<10} {'现价':>7} {'3日涨幅':>8} {'量比':>6} {'评分':>7}")
-    print(f"  {'-'*52}")
-    for _, r in top5_df.iterrows():
-        print(f"  {r['code_simple']:<8} {r['名称']:<10} "
-              f"{r['close']:>7.2f} {r['mom_3']*100:>+7.2f}% "
-              f"{r['vol_ratio']:>6.2f}x {r['score']:>7.3f}")
-
-    print("\n" + "="*60)
-    print("  ⚠️  免责：以上为量化模型输出，不构成投资建议。")
-    print("           股市有风险，亏损自负，请量力而为。")
     print("="*60)
 
 
@@ -331,72 +563,85 @@ def print_daily_pick(best_row, trade, hold_days, hold_reason, top5_df):
 # =========================
 def main():
     print("=" * 60)
-    print("  A股每日单股精选 V1.0")
-    print("  过滤：创业板 / 北交所 / 科创板 / ST")
+    print("  A股短线选股系统 V2.0（带回测功能）")
     print("=" * 60)
 
     try:
         bs_login()
 
-        # 1. 获取股票列表
+        # 获取股票列表
         stock_list = get_stock_list()
-        name_map   = dict(zip(stock_list["code"], stock_list["code_name"]))
+        name_map = dict(zip(stock_list["code"], stock_list["code_name"]))
 
-        # 2. 拉取历史数据
-        end_date   = datetime.now()
-        start_date = end_date - timedelta(days=CFG.LOOKBACK_DAYS)
-        hist       = get_hist(
-            stock_list,
-            start_date.strftime("%Y-%m-%d"),
-            end_date.strftime("%Y-%m-%d"),
-            max_stocks=CFG.MAX_STOCKS
-        )
+        # 回测模式
+        print("\n" + "-"*60)
+        print("  🔬 回测模式")
+        print("-"*60)
 
-        if hist.empty:
-            print("❌ 历史数据为空，退出")
+        # 回测参数
+        backtest_start = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        backtest_end = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        data_start = (datetime.now() - timedelta(days=500)).strftime("%Y-%m-%d")
+
+        print(f"  数据拉取区间: {data_start} ~ {backtest_end}")
+        print(f"  回测区间: {backtest_start} ~ {backtest_end}")
+
+        # 拉取完整历史数据
+        hist_full = get_all_hist(stock_list, data_start, backtest_end, CFG.MAX_STOCKS)
+
+        if hist_full.empty:
+            print("❌ 历史数据为空")
+            bs_logout()
             return
 
-        # 3. 计算因子
-        factors = calc_factors(hist, name_map)
-        if factors.empty:
-            print("❌ 因子计算结果为空（可能今日无满足条件股票）")
-            return
+        print(f"✅ 成功获取 {hist_full['code'].nunique()} 支股票的历史数据")
 
-        print(f"✅ 满足条件股票: {len(factors)} 支")
+        # 运行回测
+        engine = BacktestEngine(hist_full, backtest_start, backtest_end)
+        report = engine.run(top_k=1, capital=CFG.TOTAL_CAPITAL)
+        print_report(report)
 
-        # 4. 评分排序
-        scored = score_short(factors)
+        # 实盘选股（最新一个交易日）
+        print("\n" + "-"*60)
+        print("  📅 最新交易日选股")
+        print("-"*60)
 
-        # 5. 价格过滤（确保1手买得起）
-        budget = CFG.TOTAL_CAPITAL * 0.80
-        scored = scored[scored["close"] * 100 <= budget]
+        latest_date = hist_full["date"].max()
+        print(f"  数据截止日期: {latest_date}")
 
-        if scored.empty:
-            print(f"❌ 资金不足，当前资金 {CFG.TOTAL_CAPITAL} 元无法买入任何符合条件股票")
-            print(f"   建议提高 TOTAL_CAPITAL 或降低 PRICE_HIGH")
-            return
+        top10 = daily_selection(stock_list, name_map, latest_date)
 
-        # 6. 取最优1只 + 备选5只
-        best      = scored.iloc[0]
-        top5      = scored.iloc[1:6]
+        if top10 is not None and not top10.empty:
+            print(f"\n  📋 TOP10 选股结果")
+            print(f"  {'排名':<5} {'代码':<10} {'名称':<10} {'现价':>7} {'3日动量':>8} {'量比':>6} {'评分':>7}")
+            print(f"  {'-'*60}")
+            for i, (_, row) in enumerate(top10.iterrows()):
+                print(f"  {i+1:<5} {row['code_simple']:<10} {row['名称']:<10} "
+                      f"{row['close']:>7.2f} {row['mom_3']*100:>+7.2f}% "
+                      f"{row['vol_ratio']:>6.2f}x {row['score']:>7.3f}")
 
-        # 7. 持有建议
-        hold_days, hold_reason = suggest_hold_days(best)
+            # 保存结果
+            output = top10[["code_simple", "名称", "close", "mom_3",
+                           "mom_5", "vol_ratio", "vol_10", "score"]].copy()
+            output.columns = ["代码", "名称", "现价", "3日涨幅", "5日涨幅", "量比", "波动率", "评分"]
+            output["3日涨幅"] = output["3日涨幅"].map(lambda x: f"{x*100:+.2f}%")
+            output["5日涨幅"] = output["5日涨幅"].map(lambda x: f"{x*100:+.2f}%")
+            output.to_csv("selected_stocks.csv", index=False, encoding="utf-8-sig")
+            print(f"\n💾 结果已保存至 selected_stocks.csv")
+        else:
+            print("  ❌ 当日无满足条件的股票")
+            pd.DataFrame(columns=["代码", "评分"]).to_csv("selected_stocks.csv", index=False)
 
-        # 8. 计算交易金额
-        trade = calc_trade(best, CFG.TOTAL_CAPITAL)
+        # 保存回测交易记录
+        if engine.trades:
+            trades_df = pd.DataFrame(engine.trades)
+            trades_df.to_csv("backtest_trades.csv", index=False, encoding="utf-8-sig")
+            print("💾 回测交易记录已保存至 backtest_trades.csv")
 
-        # 9. 输出结果
-        print_daily_pick(best, trade, hold_days, hold_reason, top5)
-
-        # 10. 保存CSV
-        output = scored.head(10)[["code_simple", "名称", "close", "mom_3",
-                                   "mom_5", "vol_ratio", "vol_10", "score"]].copy()
-        output.columns = ["代码", "名称", "现价", "3日涨幅", "5日涨幅", "量比", "波动率", "评分"]
-        output["3日涨幅"] = output["3日涨幅"].map(lambda x: f"{x*100:+.2f}%")
-        output["5日涨幅"] = output["5日涨幅"].map(lambda x: f"{x*100:+.2f}%")
-        output.to_csv("selected_stocks.csv", index=False, encoding="utf-8-sig")
-        print("\n💾 结果已保存至 selected_stocks.csv")
+        # 保存净值曲线
+        if engine.equity_curve is not None and not engine.equity_curve.empty:
+            engine.equity_curve.to_csv("backtest_equity.csv", index=False, encoding="utf-8-sig")
+            print("💾 回测净值曲线已保存至 backtest_equity.csv")
 
     except Exception as e:
         print(f"\n❌ 错误: {e}")
@@ -405,7 +650,7 @@ def main():
 
     finally:
         bs_logout()
-        print("✅ 完成")
+        print("\n✅ 完成")
 
 
 if __name__ == "__main__":
