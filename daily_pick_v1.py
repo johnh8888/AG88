@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 # =============================================================
-# A股短线选股系统 V9.0 — 低位买入 · 高命中率版
+# A股短线选股系统 V9.1 — 低位买入 · 条件平衡版
 #
-# 核心重构（解决V7.0 亏损-24%问题）：
+# V9.1 修复（解决V9.0 一周无选股问题）：
 #
-# 【根本原因】V7.0 买在动量高点（RSI 65+、KDJ 70+）
-#             止损率49%，盈亏比仅1:1，必然亏损
+# 【根本原因】V9.0 六大硬条件同日全满足概率极低：
+#   - ma_bull_full（四线全排列）要求过严
+#   - recent_high 只看10日，回调幅度容易超标被过滤
+#   - vol_3d_max_lag <= 0.85 回调缩量要求过严
+#   - RSI <= 52 / KDJ_J <= 60 双重低位过滤叠加
 #
-# 【V9.0 核心策略：强趋势中的低位回调买点】
-#   条件1  趋势确认：MA5>MA10>MA20>MA60 四线多头排列
-#   条件2  回调确认：价格从阶段高点回调3%~12%（不追涨）
-#   条件3  超卖确认：KDJ_J < 30 或 RSI < 45（低位信号）
-#   条件4  缩量确认：回调期间量比 < 0.8（缩量回调，非出货）
-#   条件5  启动确认：今日收阳+量比≥1.2（放量启动信号）
-#   条件6  位置确认：价格在MA20~MA60之间（黄金买入区）
-#
-# 【止盈止损重构】
-#   止损：ATR×1.5（更宽），不被轻易扫损
-#   止盈：+8% 卖50%，+15% 卖剩余（扩大目标位，提升盈亏比）
-#   移动止损：回调7%触发（给利润更多空间）
+# 【V9.1 核心调整】
+#   ① 四线全排列 → 三线排列（MA5>MA10>MA20）
+#   ② recent_high 窗口 10日 → 20日（更合理的阶段高点）
+#   ③ 回调幅度上限 15% → 20%
+#   ④ 回调下限 3% → 2%
+#   ⑤ SHRINK_VOL_MAX 0.85 → 1.10（允许平量回调）
+#   ⑥ LAUNCH_VOL_MIN 1.20 → 1.05（轻微放量即可）
+#   ⑦ RSI_BUY_MAX 52 → 58
+#   ⑧ KDJ_J_BUY_MAX 60 → 72
+#   ⑨ 大盘评分阈值 3 → 2（适度宽松）
 #
 # 依赖：pip install baostock pandas numpy
 # =============================================================
@@ -47,26 +48,29 @@ class CFG:
     SELL_TAX        = 0.001
     SLIPPAGE        = 0.001
 
-    # ── 止盈止损（扩大目标位，盈亏比从1:1提升到2:1+）──
-    ATR_MULT        = 1.5        # ATR×1.5，宽一点，减少误止损
-    STOP_LOSS_FIXED = -0.07      # 固定止损兜底 -7%
-    TAKE1_PCT       = 0.08       # 第一止盈 +8%（卖50%）
-    TAKE2_PCT       = 0.15       # 第二止盈 +15%（卖剩余）
-    TRAILING_PCT    = 0.07       # 移动止损回撤7%
+    # ── 止盈止损 ──
+    ATR_MULT        = 1.5
+    STOP_LOSS_FIXED = -0.07
+    TAKE1_PCT       = 0.08
+    TAKE2_PCT       = 0.15
+    TRAILING_PCT    = 0.07
     BREAK_MA_DAYS   = 3
 
-    MAX_HOLD_DAYS   = 20         # 延长持有等待利润
+    MAX_HOLD_DAYS   = 20
     POSITION_PCT    = 0.45
     MAX_POSITIONS   = 2
-    MARKET_MIN_SCORE= 3          # 大盘需≥3分才买（更严格）
+    MARKET_MIN_SCORE= 2          # ⬇ 3→2，大盘要求适度放宽
 
-    # ── 回调买点参数（V9.0核心）──
-    PULLBACK_MIN    = 0.03       # 最小回调3%（必须从高点有所回落）
-    PULLBACK_MAX    = 0.15       # 最大回调15%（超过则趋势可能破坏）
-    SHRINK_VOL_MAX  = 0.85       # 回调期间量比≤0.85（缩量健康回调）
-    LAUNCH_VOL_MIN  = 1.20       # 启动日量比≥1.20（放量确认）
-    RSI_BUY_MAX     = 52         # 买入RSI上限（低位买入）
-    KDJ_J_BUY_MAX   = 60         # 买入KDJ_J上限（低位）
+    # ── 回调买点参数（V9.1 已放宽）──
+    PULLBACK_MIN    = 0.02       # ⬇ 3%→2%，允许浅回调
+    PULLBACK_MAX    = 0.20       # ⬆ 15%→20%，允许深一点回调
+    SHRINK_VOL_MAX  = 1.10       # ⬆ 0.85→1.10，允许平量回调
+    LAUNCH_VOL_MIN  = 1.05       # ⬇ 1.20→1.05，轻微放量即可
+    RSI_BUY_MAX     = 58         # ⬆ 52→58
+    KDJ_J_BUY_MAX   = 72         # ⬆ 60→72
+
+    # ── recent_high 窗口（V9.1）──
+    RECENT_HIGH_DAYS = 20        # ⬆ 10→20日，阶段高点更合理
 
 
 # ─────────────────────────────────────────────
@@ -222,10 +226,10 @@ def calc_boll(df, n=20, k=2):
 
 
 # ─────────────────────────────────────────────
-# [FIXED] 因子预计算 — 消除未来函数
+# 因子预计算（消除未来函数）
 # ─────────────────────────────────────────────
 def precompute_factors(df):
-    print("⚙️  计算因子（V7.0，已修复未来函数泄露）...")
+    print("⚙️  计算因子（V9.1，条件平衡版）...")
     df = df.sort_values(["code","date"]).copy()
 
     # ── 基础收益/动量 ──
@@ -235,7 +239,7 @@ def precompute_factors(df):
     df["mom_20"]  = df.groupby("code")["close"].pct_change(20)
     df["vol_10"]  = df.groupby("code")["ret"].transform(lambda x: x.rolling(10).std())
 
-    # ── 成交额均值（用shift(1)排除当日，消除泄露）★BUG2修复 ──
+    # ── 成交额均值（shift(1)排除当日）──
     df["amt_10"]  = df.groupby("code")["amount"].transform(
         lambda x: x.shift(1).rolling(10).mean()
     )
@@ -243,7 +247,7 @@ def precompute_factors(df):
         lambda x: x.shift(1).rolling(30).mean()
     )
 
-    # ── 量比（用前5日均量，不含当日）★BUG2修复 ──
+    # ── 量比（前5日均量，不含当日）──
     df["vol_ma5_prev"] = df.groupby("code")["volume"].transform(
         lambda x: x.shift(1).rolling(5).mean()
     )
@@ -264,9 +268,8 @@ def precompute_factors(df):
     df["above_ma60"] = (df["close"] > df["ma60"]).astype(int)
     df["ma5_gt_ma20"]= (df["ma5"]   > df["ma20"]).astype(int)
 
-    # ── 60日新高回调形态（趋势强度）★NEW1 ──
+    # ── 60日新高形态 ──
     df["high_60"] = df.groupby("code")["high"].transform(lambda x: x.rolling(60).max())
-    # 价格在60日高点的80%以上但未超过（回调买点）
     df["near_high60"] = (
         (df["close"] >= df["high_60"] * 0.80) &
         (df["close"] <= df["high_60"] * 0.98)
@@ -278,9 +281,7 @@ def precompute_factors(df):
     rsi_l, atr_l = [], []
     bu_l, bm_l, bl_l = [], [], []
     below_ma10_l = []
-    # ★NEW2 量价背离（价涨量缩）
     vol_diverge_l = []
-    # ★NEW3 RSI超卖反弹信号
     rsi_signal_l = []
 
     for code, grp in df.groupby("code"):
@@ -291,16 +292,13 @@ def precompute_factors(df):
         atr         = calc_atr(grp)
         bu, bm, bl  = calc_boll(grp)
 
-        # 连续N日低于MA10
         close_below = (grp["close"] < grp["close"].rolling(10).mean()).astype(int)
         consec_below = close_below.rolling(CFG.BREAK_MA_DAYS).sum()
 
-        # ★NEW2 量价背离：最近3日价格创新高但量能下降
         price_up   = grp["close"] > grp["close"].shift(3)
         vol_down   = grp["volume"] < grp["volume"].shift(3) * 0.85
         vol_diverge = (price_up & vol_down).astype(int)
 
-        # ★BUG6修复 RSI超卖后反弹信号：RSI从30以下回升穿越40
         rsi_oversold_bounce = (
             (rsi > 40) & (rsi.shift(2) < 30)
         ).astype(int)
@@ -324,10 +322,10 @@ def precompute_factors(df):
     df["boll_mid"]     = pd.concat(bm_l)
     df["boll_lower"]   = pd.concat(bl_l)
     df["ma10_below_n"] = pd.concat(below_ma10_l)
-    df["vol_diverge"]  = pd.concat(vol_diverge_l)   # ★NEW2
-    df["rsi_bounce"]   = pd.concat(rsi_signal_l)    # ★NEW3
+    df["vol_diverge"]  = pd.concat(vol_diverge_l)
+    df["rsi_bounce"]   = pd.concat(rsi_signal_l)
 
-    # ── KDJ金叉（严格：从低位<50穿越）──
+    # ── KDJ金叉（从低位穿越）──
     df["kdj_golden"] = (
         (df["kdj_K"] > df["kdj_D"]) &
         (df["kdj_K"].shift(1) <= df["kdj_D"].shift(1)) &
@@ -335,7 +333,7 @@ def precompute_factors(df):
         (df["kdj_K"] < 75)
     ).astype(int)
 
-    # ── 量能趋势（shift避免泄露）──
+    # ── 量能趋势 ──
     df["vol_trend"] = df.groupby("code")["vol_ratio"].transform(
         lambda x: x.shift(1).rolling(5).mean()
     )
@@ -347,69 +345,78 @@ def precompute_factors(df):
     ).astype(int)
 
     # ════════════════════════════════════════════
-    # V9.0 核心：回调买点形态检测
+    # V9.1 核心：回调买点形态（条件已放宽）
     # ════════════════════════════════════════════
 
-    # 1. 近10日最高价（阶段高点）
+    # 1. 近N日最高价（V9.1 改为20日，更合理）
     df["recent_high"] = df.groupby("code")["high"].transform(
-        lambda x: x.shift(1).rolling(10).max()   # shift(1)避免当日泄露
+        lambda x: x.shift(1).rolling(CFG.RECENT_HIGH_DAYS).max()
     )
 
-    # 2. 回调幅度 = (阶段高点 - 当前收盘) / 阶段高点
+    # 2. 回调幅度
     df["pullback_pct"] = (df["recent_high"] - df["close"]) / df["recent_high"].replace(0, np.nan)
 
-    # 3. 回调期间是否缩量：近3日最大量比（shift后）
+    # 3. 回调期间量比（近3日最大，shift后）
     df["vol_3d_max_lag"] = df.groupby("code")["vol_ratio"].transform(
         lambda x: x.shift(1).rolling(3).max()
     )
 
-    # 4. 今日是否收阳（低位启动信号）
+    # 4. 今日收阳
     df["is_up_day"] = (df["close"] > df["open"]).astype(int)
 
-    # 5. MA多头排列（四线排列）
+    # 5. 均线排列
     df["ma5_gt_ma10"] = (df["ma5"] > df["ma10"]).astype(int)
     df["ma10_gt_ma20"]= (df["ma10"]> df["ma20"]).astype(int)
     df["ma20_gt_ma60"]= (df["ma20"]> df["ma60"]).astype(int)
-    df["ma_bull_full"]= (
+
+    # ★V9.1核心改动①：三线排列（去掉ma20_gt_ma60硬要求）
+    df["ma_bull_3"] = (
+        df["ma5_gt_ma10"] & df["ma10_gt_ma20"]
+    ).astype(int)
+
+    # 四线排列（仅用于加分，不再作为硬门槛）
+    df["ma_bull_full"] = (
         df["ma5_gt_ma10"] & df["ma10_gt_ma20"] & df["ma20_gt_ma60"]
     ).astype(int)
 
-    # 6. 价格位于MA20和MA60之间（黄金买入区：强趋势低点）
+    # 6. 价格位于MA20上方（趋势未破）
     df["in_golden_zone"] = (
-        (df["close"] > df["ma20"]) &           # 在MA20上方（趋势未破）
-        (df["close"] < df["ma60"] * 1.08)      # 但未远离MA60（不追高）
+        (df["close"] > df["ma20"]) &
+        (df["close"] < df["ma60"] * 1.10)   # 略微放宽
     ).astype(int)
 
-    # 7. 综合回调买点信号（必须同时满足）
+    # 7. 综合回调买点信号（V9.1 放宽后）
     df["pullback_buy"] = (
-        # 趋势必须多头排列
-        (df["ma_bull_full"] == 1) &
-        # 有回调（3%~15%）
+        # ★改动①：三线排列替代四线
+        (df["ma_bull_3"] == 1) &
+        # ★改动②：回调幅度放宽
         (df["pullback_pct"] >= CFG.PULLBACK_MIN) &
         (df["pullback_pct"] <= CFG.PULLBACK_MAX) &
-        # 回调期间缩量（健康回调，非出货）
+        # ★改动③：缩量要求放宽
         (df["vol_3d_max_lag"] <= CFG.SHRINK_VOL_MAX) &
-        # 今日放量启动
+        # ★改动④：放量门槛降低
         (df["vol_ratio"] >= CFG.LAUNCH_VOL_MIN) &
         # 今日收阳
         (df["is_up_day"] == 1) &
-        # RSI在低位（不买高位）
+        # ★改动⑤：RSI上限提高
         (df["rsi"] <= CFG.RSI_BUY_MAX) &
-        # KDJ_J在低位
+        # ★改动⑥：KDJ_J上限提高
         (df["kdj_J"] <= CFG.KDJ_J_BUY_MAX)
     ).astype(int)
 
-    print(f"✅ 因子计算完成（回调买点信号股数：{df[df['pullback_buy']==1]['code'].nunique()} 支/日平均）")
+    signal_count = df[df["pullback_buy"]==1]["code"].nunique()
+    print(f"✅ 因子计算完成（回调买点信号股数：{signal_count} 支/日平均）")
+    if signal_count == 0:
+        print("  ⚠️ 仍无信号，请检查数据质量或进一步放宽参数")
     return df
 
 
 # ─────────────────────────────────────────────
-# 大盘择时（评分制，≥2分才允许买入）
+# 大盘择时（评分制）
 # ─────────────────────────────────────────────
 def market_score(index_df, target_date):
-    """返回大盘评分（0-5），低于CFG.MARKET_MIN_SCORE禁止买入"""
     if index_df.empty:
-        return 5  # 无数据默认放行
+        return 5
     idx = index_df[index_df["date"] <= target_date].copy()
     if len(idx) < 30:
         return 5
@@ -418,29 +425,27 @@ def market_score(index_df, target_date):
     idx["ma20"] = idx["close"].rolling(20).mean()
     idx["ma60"] = idx["close"].rolling(60).mean()
     idx["ma20_slope"] = idx["ma20"].diff(5)
-    dif, dea, macd_hist = calc_macd(idx)
+    dif, dea, _ = calc_macd(idx)
 
     latest = idx.iloc[-1]
     score = 0
-    score += int(float(latest["close"]) > float(latest["ma20"]))   # 站上MA20
-    score += int(float(latest["close"]) > float(latest["ma60"]))   # 站上MA60
-    score += int(float(latest["ma5"])   > float(latest["ma20"]))   # MA5>MA20金叉
-    score += int(float(latest["ma20_slope"]) > 0)                  # MA20向上
-    score += int(float(dif.iloc[-1])    > 0)                       # MACD正值
+    score += int(float(latest["close"]) > float(latest["ma20"]))
+    score += int(float(latest["close"]) > float(latest["ma60"]))
+    score += int(float(latest["ma5"])   > float(latest["ma20"]))
+    score += int(float(latest["ma20_slope"]) > 0)
+    score += int(float(dif.iloc[-1])    > 0)
     return score
 
 
 # ─────────────────────────────────────────────
-# 选股评分 V9.0 — 低位回调买点逻辑
+# 选股评分 V9.1
 # ─────────────────────────────────────────────
 def select_stocks(df_factors, target_date, held_codes):
     today = df_factors[df_factors["date"] == target_date].copy()
     if today.empty:
         return pd.DataFrame()
 
-    # ══════════════════════════════════════
-    # 第一关：基础流动性过滤
-    # ══════════════════════════════════════
+    # 第一关：基础流动性
     today = today[
         today["close"].between(CFG.PRICE_LOW, CFG.PRICE_HIGH) &
         (today["amt_10"] >= CFG.MIN_AMOUNT) &
@@ -449,47 +454,38 @@ def select_stocks(df_factors, target_date, held_codes):
     if today.empty:
         return today
 
-    # ══════════════════════════════════════
-    # 第二关：必须触发回调买点信号（硬条件，不打折）
-    # ══════════════════════════════════════
+    # 第二关：回调买点信号（硬条件）
     today = today[today["pullback_buy"] == 1].copy()
     if today.empty:
         return today
 
-    # ══════════════════════════════════════
-    # 第三关：MACD辅助确认（不要求在零轴上，允许刚翻正）
-    # ══════════════════════════════════════
+    # 第三关：MACD金叉 + 无量价背离
     today = today[
-        (today["macd_dif"] > today["macd_dea"]) &  # DIF在DEA上方（MACD金叉）
-        (today["vol_diverge"] == 0)                  # 无量价背离
+        (today["macd_dif"] > today["macd_dea"]) &
+        (today["vol_diverge"] == 0)
     ].copy()
     if today.empty:
         return today
 
-    # ══════════════════════════════════════
-    # 评分（低位质量排序）
-    # ══════════════════════════════════════
+    # ── 评分 ──
 
-    # A. 回调质量（40%）：回调幅度越接近理想区间，缩量越好
-    #    理想回调：5%~10%，量比~0.6（深度回调缩量）
+    # A. 回调质量（35%）
     ideal_pullback = 0.07
     today["s_pullback"] = (
-        # 回调幅度接近7%得分最高（两侧递减）
-        (1 - (today["pullback_pct"] - ideal_pullback).abs() / 0.08).clip(0, 1) * 0.50 +
-        # 回调期间量比越小越好（越缩量越健康）
-        (1 - today["vol_3d_max_lag"].clip(0, 1)).clip(0, 1) * 0.30 +
-        # KDJ_J越低得分越高（超卖反弹潜力大）
+        (1 - (today["pullback_pct"] - ideal_pullback).abs() / 0.10).clip(0, 1) * 0.50 +
+        (1 - today["vol_3d_max_lag"].clip(0, 1.5) / 1.5).clip(0, 1) * 0.30 +
         (1 - today["kdj_J"].clip(0, 100) / 100) * 0.20
     )
 
-    # B. 趋势强度（30%）：均线排列越好+MACD越强
+    # B. 趋势强度（35%）：四线排列得额外加分
     today["s_trend"] = (
-        today["ma_bull_full"].astype(float) * 0.40 +
-        today["macd_strong"].astype(float) * 0.30 +
-        today["in_golden_zone"].astype(float) * 0.30
+        today["ma_bull_3"].astype(float)    * 0.30 +
+        today["ma_bull_full"].astype(float) * 0.20 +   # 四线排列加分
+        today["macd_strong"].astype(float)  * 0.25 +
+        today["in_golden_zone"].astype(float)* 0.25
     )
 
-    # C. 量能质量（20%）：今日放量启动的力度
+    # C. 量能质量（20%）
     amt_ratio = (today["amt_10"] / today["amt_30"].replace(0, np.nan))
     today["s_vol"] = (
         today["vol_ratio"].clip(1, 5).rank(pct=True) * 0.50 +
@@ -497,12 +493,12 @@ def select_stocks(df_factors, target_date, held_codes):
         today["kdj_golden"].astype(float) * 0.20
     )
 
-    # D. RSI位置（10%）：RSI越低越好（超卖反弹）
-    today["s_rsi"] = (1 - today["rsi"].clip(20, 52) / 52)
+    # D. RSI位置（10%）
+    today["s_rsi"] = (1 - today["rsi"].clip(20, 58) / 58)
 
     today["score"] = (
-        today["s_pullback"] * 0.40 +
-        today["s_trend"]    * 0.30 +
+        today["s_pullback"] * 0.35 +
+        today["s_trend"]    * 0.35 +
         today["s_vol"]      * 0.20 +
         today["s_rsi"]      * 0.10
     )
@@ -512,28 +508,16 @@ def select_stocks(df_factors, target_date, held_codes):
 
 
 # ─────────────────────────────────────────────
-# [FIXED] 动态止损：取较低止损价（BUG3修复）
+# 动态止损
 # ─────────────────────────────────────────────
 def calc_stop_price(buy_price, atr_val):
-    """
-    ★BUG3修复：原代码用max()取"较高止损价"，逻辑错误。
-    正确逻辑：ATR止损和固定止损都是下限，应取较低值（更宽松），
-    让价格有足够空间波动，减少被扫损。
-    若要更保守，则取较高值，但需要配合更大的目标位。
-    """
     atr_stop   = buy_price - CFG.ATR_MULT * atr_val
-    fixed_stop = buy_price * (1 + CFG.STOP_LOSS_FIXED)  # -5%兜底
-    # 取两者之间较高的（=更保守的止损线）
-    # 注意：这里"较高"意味着止损线离买入价更近
-    # 建议：用ATR止损为主，fixed只作最大损失兜底（取较低值）
+    fixed_stop = buy_price * (1 + CFG.STOP_LOSS_FIXED)
     return max(atr_stop, fixed_stop)
-    # ↑ 如果ATR算出-3%止损但fixed是-5%，取-3%（更紧）
-    # 如果ATR算出-8%止损，取fixed的-5%（防止过宽）
-    # 这才是正确的"兜底"逻辑
 
 
 # ─────────────────────────────────────────────
-# [FIXED] 回测引擎 — 修复未来函数+分批止盈+滑点
+# 回测引擎
 # ─────────────────────────────────────────────
 class BacktestEngine:
     def __init__(self, df_factors, index_df, start_date, end_date):
@@ -545,11 +529,9 @@ class BacktestEngine:
         self.equity_curve = []
 
     def _sell(self, h, sell_price, today, reason, cash, shares_to_sell=None):
-        """★BUG5修复：按股数比例精确计算cost"""
         shares = shares_to_sell if shares_to_sell is not None else h["shares"]
-        ratio  = shares / h["total_shares"]   # 用总股数比例计算成本
+        ratio  = shares / h["total_shares"]
         cost_portion = h["total_cost"] * ratio
-        # ★NEW5 加入卖出滑点
         actual_sell = sell_price * (1 - CFG.SLIPPAGE)
         revenue = shares * actual_sell * (1 - CFG.COMMISSION - CFG.SELL_TAX)
         profit  = revenue - cost_portion
@@ -594,31 +576,22 @@ class BacktestEngine:
                 sell_price = cur_close
                 reason     = ""
 
-                # ① ATR止损（★BUG3修复后的止损价）
                 if cur_low <= h["stop_price"]:
                     sell_all   = True
                     sell_price = h["stop_price"]
                     reason     = "ATR止损"
-
-                # ② 移动止盈（从最高点回落）
                 elif (h["highest"] > h["buy_price"] * (1 + CFG.TAKE1_PCT * 0.8) and
                       cur_close <= h["highest"] * (1 - CFG.TRAILING_PCT)):
                     sell_all   = True
                     sell_price = cur_close
                     reason     = "移动止盈"
-
-                # ③ 连续N日低于MA10
                 elif float(last.get("ma10_below_n", 0) or 0) >= CFG.BREAK_MA_DAYS:
                     sell_all   = True
                     sell_price = cur_close
                     reason     = "跌破MA10"
-
-                # ④ 到期清仓
                 elif hold_days >= CFG.MAX_HOLD_DAYS:
                     sell_all   = True
                     reason     = "到期清仓"
-
-                # ⑤ 第一批止盈（★BUG5修复：用total_shares）
                 elif (not h.get("take1_done") and
                       cur_high >= h["buy_price"] * (1 + CFG.TAKE1_PCT)):
                     shares_half = int(h["shares"] * 0.5 / 100) * 100
@@ -627,12 +600,9 @@ class BacktestEngine:
                         cash = self._sell(h, sell_price_1, today, "分批止盈1", cash, shares_half)
                         h["shares"] -= shares_half
                         h["take1_done"] = True
-                        # 止损上移到买入价（保本）
                         h["stop_price"] = max(h["stop_price"], h["buy_price"] * 1.002)
                     new_holdings.append(h)
                     continue
-
-                # ⑥ 第二批止盈
                 elif (h.get("take1_done") and
                       cur_high >= h["buy_price"] * (1 + CFG.TAKE2_PCT)):
                     sell_all   = True
@@ -646,7 +616,7 @@ class BacktestEngine:
 
             holdings = new_holdings
 
-            # ── 买入（★BUG1修复：用次日开盘价模拟T+1执行）──
+            # ── 买入（次日开盘T+1执行）──
             mkt = market_score(self.index_df, today)
             can_buy = mkt >= CFG.MARKET_MIN_SCORE
             if can_buy and len(holdings) < CFG.MAX_POSITIONS:
@@ -657,14 +627,13 @@ class BacktestEngine:
                     if len(holdings) >= CFG.MAX_POSITIONS:
                         break
 
-                    # ★BUG1修复：找到次日的开盘价作为实际买入价
                     future_dates = sorted(self.df_factors[
                         (self.df_factors["code"] == row["code"]) &
                         (self.df_factors["date"] > today)
                     ]["date"].unique())
 
                     if not future_dates:
-                        continue  # 没有次日数据，跳过
+                        continue
                     next_date = future_dates[0]
                     next_day  = self.df_factors[
                         (self.df_factors["code"] == row["code"]) &
@@ -674,13 +643,10 @@ class BacktestEngine:
                         continue
                     next_open = float(next_day["open"].iloc[0])
 
-                    # 跳过次日跳空高开超过3%（追高保护）
                     if next_open > float(row["close"]) * 1.03:
                         continue
 
-                    # ★NEW5 加入买入滑点
                     buy_px = next_open * (1 + CFG.SLIPPAGE)
-
                     budget = min(cash * 0.95, CFG.TOTAL_CAPITAL * CFG.POSITION_PCT)
                     if budget < buy_px * 100:
                         continue
@@ -695,9 +661,9 @@ class BacktestEngine:
                     cash -= cost
                     holdings.append({
                         "code": row["code"], "shares": shares,
-                        "total_shares": shares,     # ★BUG5修复：保留总股数
-                        "total_cost": cost,         # ★BUG5修复：保留总成本
-                        "buy_date": next_date,      # ★BUG1修复：实际买入日期
+                        "total_shares": shares,
+                        "total_cost": cost,
+                        "buy_date": next_date,
                         "buy_price": buy_px,
                         "cost": cost, "highest": next_open,
                         "stop_price": stop_price,
@@ -727,7 +693,7 @@ class BacktestEngine:
 
     def generate_report(self):
         print("\n" + "="*65)
-        print("  📈 回测报告  (V7.0 漏洞修复版)")
+        print("  📈 回测报告  (V9.1 条件平衡版)")
         print("="*65)
         if not self.equity_curve:
             print("⚠️ 无净值数据"); return
@@ -748,7 +714,6 @@ class BacktestEngine:
                     if excess.std() > 0 else 0)
         calmar   = annual_ret / abs(max_dd) if max_dd != 0 else 0
 
-        # 空仓天数统计
         idle_days = (eq_df["positions"] == 0).sum()
 
         print(f"  初始资金     : {init:>12,.0f} 元")
@@ -791,23 +756,21 @@ class BacktestEngine:
                       f"{t['buy_price']:>7.2f} {t['sell_price']:>7.2f} "
                       f"{t['profit']:>+8.0f} {t['reason']}")
 
-            # 质量诊断
             print(f"\n  🩺 策略质量诊断:")
             issues = []
             if win_rate < 0.40:
                 issues.append("⚠️  胜率低于40%，选股信号质量需提升")
             if pr < 1.5:
-                issues.append("⚠️  盈亏比低于1.5:1，止盈位设置偏低或止损过紧")
+                issues.append("⚠️  盈亏比低于1.5:1，止盈位偏低或止损过紧")
             if max_dd < -0.20:
                 issues.append("⚠️  最大回撤超20%，风险控制需加强")
-            if idle_days / n_days > 0.70:
-                issues.append("⚠️  空仓率超70%，选股条件可能过严")
+            if idle_days / n_days > 0.60:
+                issues.append("⚠️  空仓率超60%，选股条件仍偏严")
             if not issues:
                 issues.append("✅ 各项指标正常")
             for msg in issues:
                 print(f"    {msg}")
 
-            # 综合评估
             print(f"\n  📋 综合评估:")
             if sharpe >= 1.5 and max_dd > -0.15 and win_rate >= 0.50 and calmar >= 1.5:
                 print("  ✅ 策略表现优秀，可考虑谨慎实盘")
@@ -816,13 +779,13 @@ class BacktestEngine:
             else:
                 print("  ❌ 策略表现较差，不建议实盘，需重新检视逻辑")
 
-            tr_df.to_csv("backtest_trades_v9.csv", index=False, encoding="utf-8-sig")
-            eq_df.to_csv("backtest_equity_v9.csv", index=False, encoding="utf-8-sig")
-            print(f"\n  💾 交易记录 → backtest_trades_v9.csv")
-            print(f"  💾 净值曲线 → backtest_equity_v9.csv")
+            tr_df.to_csv("backtest_trades_v91.csv", index=False, encoding="utf-8-sig")
+            eq_df.to_csv("backtest_equity_v91.csv", index=False, encoding="utf-8-sig")
+            print(f"\n  💾 交易记录 → backtest_trades_v91.csv")
+            print(f"  💾 净值曲线 → backtest_equity_v91.csv")
         else:
-            print("\n  ⚠️ 回测期间无成交（条件过严或数据不足）")
-            print("  建议：适当放宽 MIN_AMOUNT / PRICE_LOW / RSI区间等参数")
+            print("\n  ⚠️ 回测期间无成交（条件仍过严或数据不足）")
+            print("  建议进一步放宽：MIN_AMOUNT / PULLBACK_MAX / RSI_BUY_MAX")
 
         print("="*65)
 
@@ -837,7 +800,7 @@ def today_pick(df_factors, stock_list, index_df):
     candidates= select_stocks(df_factors, today_str, set())
 
     print("\n" + "="*65)
-    print(f"  📅 {today_str}  今日精选（V9.0 低位回调版）")
+    print(f"  📅 {today_str}  今日精选（V9.1 条件平衡版）")
     print(f"  📊 大盘评分: {mkt}/5  {'✅ 可买入' if mkt>=CFG.MARKET_MIN_SCORE else '🚫 大盘偏弱，建议观望'}")
     print("="*65)
 
@@ -853,27 +816,20 @@ def today_pick(df_factors, stock_list, index_df):
     candidates["code_simple"] = candidates["code"].str.replace(r"(sh\.|sz\.)", "", regex=True)
 
     top5 = candidates.iloc[:5]
-    print(f"\n  📋 备选 TOP5（次日在【挂单下限~上限】区间挂单，跳空高开放弃）")
-    print(f"  {'代码':<8} {'名称':<10} {'现价':>6}   {'挂单区间(低~高)':^18}  {'止损':>6}  {'+8%':>6}  {'+15%':>7}  {'评分':>6}")
-    print(f"  {'-'*85}")
+    print(f"\n  📋 备选 TOP5（次日在挂单区间内挂单，跳空高开放弃）")
+    print(f"  {'代码':<8} {'名称':<10} {'现价':>6}   {'挂单区间':^16}  {'止损':>6}  {'+8%':>6}  {'+15%':>7}  {'评分':>6}")
+    print(f"  {'-'*82}")
 
     results = []
     for idx, (_, r) in enumerate(top5.iterrows()):
         price   = float(r["close"])
         atr_val = float(r.get("atr", price * 0.02) or price * 0.02)
-        high20  = float(r.get("high_20d", price))    # 20日高点
 
-        # ── 精确买入价：以今收盘价为上限，不追高 ──
-        # 今日是放量启动日，收盘价本身就是低位，
-        # 次日若平开或小幅低开则在MA10附近挂单
         ma10_px = float(r.get("ma10", price * 0.97))
         boll_m  = float(r.get("boll_mid", price * 0.97))
-        # 建议挂单价：收盘价下方0~1%，不超过MA10支撑
-        buy_upper = round(price, 2)                         # 上限：今收盘
-        buy_lower = round(max(ma10_px, boll_m) * 1.001, 2) # 下限：MA10/中轨支撑
-        # 取中间值作为参考挂单价
-        ref_buy   = round((buy_upper + buy_lower) / 2, 2)
-        ref_buy   = min(ref_buy, buy_upper)                 # 不超收盘价
+        buy_upper = round(price, 2)
+        buy_lower = round(max(ma10_px, boll_m) * 1.001, 2)
+        ref_buy   = round(min((buy_upper + buy_lower) / 2, buy_upper), 2)
 
         stop_px  = round(calc_stop_price(ref_buy, atr_val), 2)
         risk_pct = (stop_px - ref_buy) / ref_buy * 100
@@ -883,25 +839,27 @@ def today_pick(df_factors, stock_list, index_df):
         shares   = max(int(budget / ref_buy / 100) * 100, 100)
         cost     = round(shares * ref_buy * (1 + CFG.COMMISSION), 2)
 
-        pullback = float(r.get("pullback_pct", 0)) * 100   # 回调幅度%
+        pullback = float(r.get("pullback_pct", 0)) * 100
         kdj_j    = float(r.get("kdj_J", 50) or 50)
         rsi_v    = float(r.get("rsi", 50) or 50)
         vr       = float(r.get("vol_ratio", 1))
+        bull4    = "✅四线" if r.get("ma_bull_full", 0) == 1 else "🟡三线"
 
         mark = ["🥇","🥈","🥉","4️⃣ ","5️⃣ "][idx]
         print(f"  {r['code_simple']:<8} {r['名称']:<10} {price:>7.2f} "
-              f"  挂单:{buy_lower:.2f}~{buy_upper:.2f}  止损:{stop_px:.2f}"
+              f"  {buy_lower:.2f}~{buy_upper:.2f}  止损:{stop_px:.2f}"
               f"  +8%:{take1:.2f}  +15%:{take2:.2f}  {r['score']:.3f} {mark}")
 
         results.append({
             "代码": r["code_simple"], "名称": r["名称"], "现价": price,
-            "挂单下限": buy_lower, "挂单上限(收盘)": buy_upper,
+            "挂单下限": buy_lower, "挂单上限": buy_upper,
             "参考买入价": ref_buy,
             "止损价": stop_px, "风险比例": f"{risk_pct:.1f}%",
             "止盈目标1(+8%)": take1, "止盈目标2(+15%)": take2,
             "建议买入量(股)": shares, "预计成本(元)": cost,
             "ATR": round(atr_val, 3),
             "已回调幅度": f"{pullback:.1f}%",
+            "均线排列": bull4,
             "RSI": round(rsi_v, 1),
             "KDJ_J": round(kdj_j, 1),
             "量比(今日)": round(vr, 2),
@@ -909,32 +867,32 @@ def today_pick(df_factors, stock_list, index_df):
             "评分": round(r["score"], 3)
         })
 
-    # 最优推荐详解
     if results:
         best = results[0]
-        rsi_v = best['RSI']
-        kdj_j = best['KDJ_J']
+        rsi_v = best["RSI"]
+        kdj_j = best["KDJ_J"]
         print(f"\n  ─────────────────────────────────────────────────────")
         print(f"  🏆 精选推荐：【{best['代码']} {best['名称']}】")
         print(f"  ─────────────────────────────────────────────────────")
-        print(f"  📊 回调买点信号")
-        print(f"    已从高点回调  : {best['已回调幅度']}  ← 低位区")
-        print(f"    RSI           : {rsi_v:.1f}  {'✅ 低位' if rsi_v<45 else ('🟡 中位' if rsi_v<55 else '⚠️ 偏高，谨慎')}")
-        print(f"    KDJ_J         : {kdj_j:.1f}  {'✅ 超卖区' if kdj_j<30 else ('🟡 低位' if kdj_j<55 else '⚠️ 偏高')}")
-        print(f"    量比(今日)     : {best['量比(今日)']:.2f}x  ← 放量启动")
+        print(f"  📊 信号详情")
+        print(f"    均线排列      : {best['均线排列']}")
+        print(f"    已回调幅度    : {best['已回调幅度']}  ← 低位区")
+        print(f"    RSI           : {rsi_v:.1f}  {'✅ 低位' if rsi_v<48 else ('🟡 中位' if rsi_v<55 else '⚠️ 偏高')}")
+        print(f"    KDJ_J         : {kdj_j:.1f}  {'✅ 超卖' if kdj_j<30 else ('🟡 低位' if kdj_j<60 else '⚠️ 偏高')}")
+        print(f"    量比(今日)    : {best['量比(今日)']:.2f}x  ← 放量启动")
         print(f"    ATR波幅       : {best['ATR']:.3f} 元")
         print(f"\n  💰 操作计划（资金 {CFG.TOTAL_CAPITAL:,.0f} 元，仓位 {CFG.POSITION_PCT*100:.0f}%）")
-        print(f"    ★ 挂单区间  : {best['挂单下限']:.2f} ~ {best['挂单上限(收盘)']:.2f} 元")
-        print(f"       参考挂单  : {best['参考买入价']:.2f} 元（MA10/布林中轨附近）")
+        print(f"    ★ 挂单区间  : {best['挂单下限']:.2f} ~ {best['挂单上限']:.2f} 元")
+        print(f"       参考挂单  : {best['参考买入价']:.2f} 元")
         print(f"       建议股数  : {best['建议买入量(股)']} 股  预计成本: {best['预计成本(元)']:,.0f} 元")
         print(f"    🔴 止损价    : {best['止损价']:.2f} 元  (风险 {best['风险比例']}，ATR×1.5)")
         print(f"    🟡 目标一    : {best['止盈目标1(+8%)']:.2f} 元  (+8%，卖出50%仓位)")
         print(f"    🟢 目标二    : {best['止盈目标2(+15%)']:.2f} 元  (+15%，卖出剩余)")
         print(f"\n  ⚡ 离场条件（任一触发）")
-        print(f"    • 次日开盘超今收盘3% → 放弃不买（追高风险大）")
+        print(f"    • 次日开盘超今收盘3% → 放弃不买")
         print(f"    • 连续{CFG.BREAK_MA_DAYS}日收盘低于MA10 → 清仓")
-        print(f"    • 阶段高点回落超 {CFG.TRAILING_PCT*100:.0f}% → 移动止盈")
-        print(f"    • 持满 {CFG.MAX_HOLD_DAYS} 个交易日 → 到期清仓")
+        print(f"    • 阶段高点回落超{CFG.TRAILING_PCT*100:.0f}% → 移动止盈")
+        print(f"    • 持满{CFG.MAX_HOLD_DAYS}个交易日 → 到期清仓")
 
     print(f"\n" + "="*65)
     print("  ⚠️  仅供参考，不构成投资建议，股市有风险，操作需谨慎")
@@ -950,8 +908,8 @@ def today_pick(df_factors, stock_list, index_df):
 # ─────────────────────────────────────────────
 def main():
     print("="*65)
-    print("  A股选股系统 V9.0 — 低位回调买点 · 高命中率版")
-    print("  策略：强趋势回调3~15% + KDJ/RSI低位 + 放量启动确认")
+    print("  A股选股系统 V9.1 — 低位回调买点 · 条件平衡版")
+    print("  V9.0 → V9.1：放宽六大参数，解决一周无选股问题")
     print("="*65)
     try:
         bs_login()
